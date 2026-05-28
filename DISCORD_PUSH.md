@@ -15,16 +15,19 @@ short enough to fit Discord's 2k-char limit per message individually.
 > same model out — but it doesn't have to "fit" on the GPU anymore.
 >
 > ```
-> | Model                            | Layers | GPU body resident | Embed on GPU       | Speed
-> |----------------------------------|--------|-------------------|--------------------|---------
-> | Qwen2.5-0.5B   (paged)           | 24/24  | full (no eviction)| 1 of 4096 nodes    | 7.6 tok/s
-> | Qwen2.5-1.5B-Instruct (paged)    | 28/28  | full (no eviction)| 1 of 4096 nodes    | 6.6 tok/s
-> | Nous-Hermes-2-Mistral-7B (paged) |  4/32  | LRU streams body  | 1 of 4096 nodes    | runs at all
+> | Model                            | Body resident      | Embed on GPU       | Speed
+> |----------------------------------|--------------------|--------------------|---------------
+> | Qwen2.5-0.5B   (paged)           | 24/24 (no evict)   | 1 of 4096 nodes    | 7.6  tok/s
+> | Qwen2.5-1.5B-Instruct (paged)    | 28/28 (no evict)   | 1 of 4096 nodes    | 6.6  tok/s
+> | Nous-Hermes-2-Mistral-7B (paged) |  4/32 (LRU stream) | 1 of 4096 nodes    | 0.05 tok/s
 > ```
 >
 > Hardware: GTX 1650, **4 GiB VRAM**. A 7B fp16 model is ~14 GiB; before
-> Holorites, this card couldn't load it. Now it does — and a 1.5B Instruct
-> runs at 6.6 tok/s with the *whole* body resident, byte-exact.
+> Holorites, this card couldn't load it. Now it does — a 1.5B Instruct
+> at 6.6 tok/s with the *whole* body resident, byte-exact, and a 7B
+> Nous-Hermes giving the right answer on a card that has no business
+> running it (slow because PCIe is the bottleneck, not VRAM —
+> 28 layer-misses × ~430 MB per token is ~12 GB across PCIe per token).
 >
 > Repo: <https://github.com/OhBeOneKeyNoBe/Holorites>
 

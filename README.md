@@ -111,14 +111,32 @@ buy three concrete things at runtime:
    runtime can checkpoint, prefetch the next revolution's working set, or
    hand off between the memory torus and the personality torus.
 
+## Empirical results — GTX 1650, 4 GiB VRAM
+
+| Model                                | Body resident       | Embed on GPU       | Speed       |
+|--------------------------------------|---------------------|--------------------|-------------|
+| Qwen2.5-0.5B                         | 24/24 (no evict)    | 1 of 4,096 nodes   | 7.65 tok/s  |
+| Qwen2.5-1.5B-Instruct                | 28/28 (no evict)    | 1 of 4,096 nodes   | 6.58 tok/s  |
+| Nous-Hermes-2-Mistral-7B-DPO         | 4/32 (LRU stream)   | 1 of 4,096 nodes   | 0.05 tok/s  |
+
+The 7B is the "fits at all" demo — without Holorite paging, the GTX 1650
+can't load it. With paging it runs and produces correct output, but the
+PCIe is the bottleneck (each token's missed-layer transfer ≈ 12 GB across
+PCIe). For interactive speed on the 7B path, the next two prizes are
+GGUF-style int8/int4 quantization of the body (4× less PCIe) and
+per-MLP / per-attention-head sub-layer paging.
+
 ## Status
 
 - ✅ Embedding + LM-head paging — byte-exact, helical prefetch.
 - ✅ Body paging — per-layer CPU↔GPU under an LRU working-set budget.
 - ✅ Active-layer pin — prevents the active layer from evicting itself.
 - ✅ Stream-coherent prefetch (`stream_walk` driving the embedding's `_prefetch`).
+- ✅ Auto-sized working set with round-up — keeps the whole body resident
+   when it fits comfortably, switches to LRU streaming only when it must.
 - 🔄 GGUF Holoritify — extract embedding torus from `.gguf` files.
-- 🔄 Per-MLP / per-attention-head paging inside each block.
+- 🔄 Per-MLP / per-attention-head paging inside each block (cuts the
+   per-token PCIe transfer by ~4×).
 - 🔄 KV-cache paging.
 
 ## License
