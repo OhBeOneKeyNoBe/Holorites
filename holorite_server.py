@@ -197,13 +197,38 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(200, {"ok": True, "device": DEVICE,
                                          "loaded": list(_loaded.keys())})
         if self.path == "/stats":
-            # Live snapshot for the companion's 13-torus lattice view —
-            # which Holorite is active, last forward's page stats, and the
-            # active (ring, node) cell so the renderer can light it up.
+            # Live snapshot for the companion's 13-torus lattice view.
+            # We prefer the per-forward stats from the currently-loaded paged
+            # embedding (updated EVERY forward, so the visualizer pulses
+            # during generation, not only after the chat completes). Falls
+            # back to the last-finished chat's full stats when the model is
+            # idle.
+            live = None
+            try:
+                if _current_path and _current_path in _loaded:
+                    _, _, paged, full_emb_bytes = _loaded[_current_path]
+                    s = getattr(paged, "last_stats", None)
+                    if s is not None:
+                        node_bytes_per = SLOTS * paged.embedding_dim * (
+                            paged.torus.element_size() if hasattr(paged.torus, "element_size") else 2)
+                        on_gpu = s.used_units * node_bytes_per
+                        live = {
+                            "nodes_used": s.used_units,
+                            "nodes_total": s.total_units,
+                            "fraction": round(s.fraction, 4),
+                            "active_cells": s.active_cells or [],
+                            "embed_on_gpu_mb": round(on_gpu / 1_048_576, 1),
+                            "embed_full_mb": round(full_emb_bytes / 1_048_576, 1),
+                            "saved_mb": round((full_emb_bytes - on_gpu) / 1_048_576, 1),
+                            "tok_per_s": (_last_chat_stats or {}).get("tok_per_s"),
+                            "tokens": (_last_chat_stats or {}).get("tokens"),
+                            "live": True,
+                        }
+            except Exception: pass
             payload = {"ok": True, "device": DEVICE,
                        "loaded": list(_loaded.keys()),
                        "active_holorite": _current_path or "",
-                       "last_stats": _last_chat_stats}
+                       "last_stats": live or _last_chat_stats}
             return self._send_json(200, payload)
         return self._send_json(404, {"error": "not found"})
 
