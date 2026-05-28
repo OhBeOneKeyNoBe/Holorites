@@ -51,7 +51,9 @@ import torch
 # Lazy-import torus helpers so this file stays usable as a CLI even without
 # the HF stack installed (it doesn't need transformers).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from torus_lattice import embedding_to_torus, CELLS
+from torus_lattice import (embedding_to_torus, embedding_to_node_chunks,
+                           torus_level_for_vocab, CELLS, NESTED_CELLS,
+                           SHELLS, RINGS, NODES, SLOTS)
 
 GGUF_MAGIC = b"GGUF"
 
@@ -343,20 +345,15 @@ def holoritify_gguf(gguf_path: str, out_dir: str | None = None) -> str:
     hidden = int(kv.get(f"{arch}.embedding_length") or kv.get(f"{arch}.hidden_size") or 0)
     if vocab == 0 or hidden == 0:
         raise ValueError(f"GGUF header missing vocab/hidden for arch={arch!r}")
-    # Vocab overflow handling: a 64³ torus holds exactly 262,144 cells. Some
-    # of the user's own models (e.g. zioniel-v350 with vocab 262,409) carry a
-    # few hundred extra reserved/sacred tokens past that. We keep the geometry
-    # pure (still 64³) and truncate the overflow rows; the manifest records
-    # how many got dropped so the visualizer/runtime knows. The full GGUF is
-    # still what drives inference on the companion side, so no actual model
-    # capability is lost — only the lattice can't paint those last tokens.
-    overflow_vocab = 0
-    if vocab > CELLS:
-        overflow_vocab = vocab - CELLS
-        print(f"[gguf-holoritify] vocab {vocab} > torus capacity {CELLS} — "
-              f"truncating {overflow_vocab} tail tokens for the embed torus only "
-              f"(body inference uses the full GGUF, no model capability lost)")
-        vocab = CELLS
+    # Nested-torus addressing: a 64³ inner torus (the 13th, capacity 262,144)
+    # holds vocabularies up to 262k. When the model has more — like the user's
+    # own zioniel-v350 (vocab 262,409) — the enveloping 12th torus extends
+    # capacity to 64⁴ = 16,777,216, using a 4th SHELL axis from the
+    # bit-slicing. No truncation; the overflow tokens flow into shells 1..63.
+    # Storage stays compact via the flat (n_nodes, 64, D) layout (only the
+    # actual vocab rows are materialized; padded to a multiple of 64).
+    level = torus_level_for_vocab(vocab)
+    overflow_vocab = max(0, vocab - CELLS)   # how many tokens spilled into the outer shell
 
     # Find the embedding tensor — its name is conventional across GGUF arches:
     EMB_NAMES = ("token_embd.weight", "tok_embeddings.weight", "wte.weight")
@@ -373,15 +370,15 @@ def holoritify_gguf(gguf_path: str, out_dir: str | None = None) -> str:
     print(f"[gguf-holoritify] arch={arch} vocab={vocab} hidden={hidden} "
           f"emb tensor={name!r} dims={dims} dtype_id={dtype_id} off=+{off}")
 
-    # Total elements in the file = full_vocab * hidden (before any truncate).
-    file_vocab = vocab + overflow_vocab
+    # The on-disk GGUF has all `vocab` rows; we keep every one (no truncation
+    # in nested mode). file_vocab is preserved here for back-compat with the
+    # manifest field name.
+    file_vocab = vocab
     if dtype_id in _FP_TYPES:
         emb = _read_fp_tensor(gguf_path, dims, dtype_id, abs_off)
         # emb came out as (vocab, hidden) after the reshape-and-flip — verify
         if emb.shape[0] != file_vocab or emb.shape[1] != hidden:
-            # try the other orientation
             emb = emb.transpose(0, 1).contiguous()
-        if overflow_vocab > 0: emb = emb[:vocab].contiguous()
         emb = emb.to(torch.float16).contiguous()
     elif dtype_id == GGML_TYPE_Q8_0:
         n_file = file_vocab * hidden
@@ -389,8 +386,7 @@ def holoritify_gguf(gguf_path: str, out_dir: str | None = None) -> str:
         nblocks = (n_file + 31) // 32
         with open(gguf_path, "rb") as f:
             f.seek(abs_off); blob = f.read(nblocks * bs)
-        full = _dequant_q8_0(blob, nblocks * 32)[:n_file].view(file_vocab, hidden).to(torch.float16)
-        emb = full[:vocab].contiguous(); del full
+        emb = _dequant_q8_0(blob, nblocks * 32)[:n_file].view(file_vocab, hidden).to(torch.float16).contiguous()
     elif dtype_id == GGML_TYPE_Q4_K:
         n_file = file_vocab * hidden
         QK_K = 256
@@ -398,8 +394,7 @@ def holoritify_gguf(gguf_path: str, out_dir: str | None = None) -> str:
         nblocks = (n_file + QK_K - 1) // QK_K
         with open(gguf_path, "rb") as f:
             f.seek(abs_off); blob = f.read(nblocks * BS)
-        full = _dequant_q4_K(blob, nblocks * QK_K)[:n_file].view(file_vocab, hidden).to(torch.float16)
-        emb = full[:vocab].contiguous(); del full
+        emb = _dequant_q4_K(blob, nblocks * QK_K)[:n_file].view(file_vocab, hidden).to(torch.float16).contiguous()
     elif dtype_id == GGML_TYPE_Q6_K:
         n_file = file_vocab * hidden
         QK_K = 256
@@ -407,8 +402,7 @@ def holoritify_gguf(gguf_path: str, out_dir: str | None = None) -> str:
         nblocks = (n_file + QK_K - 1) // QK_K
         with open(gguf_path, "rb") as f:
             f.seek(abs_off); blob = f.read(nblocks * BS)
-        full = _dequant_q6_K(blob, nblocks * QK_K)[:n_file].view(file_vocab, hidden).to(torch.float16)
-        emb = full[:vocab].contiguous(); del full
+        emb = _dequant_q6_K(blob, nblocks * QK_K)[:n_file].view(file_vocab, hidden).to(torch.float16).contiguous()
     elif dtype_id == GGML_TYPE_Q4_0:
         n_file = file_vocab * hidden
         QK = 32
@@ -416,8 +410,7 @@ def holoritify_gguf(gguf_path: str, out_dir: str | None = None) -> str:
         nblocks = (n_file + QK - 1) // QK
         with open(gguf_path, "rb") as f:
             f.seek(abs_off); blob = f.read(nblocks * BS)
-        full = _dequant_q4_0(blob, nblocks * QK)[:n_file].view(file_vocab, hidden).to(torch.float16)
-        emb = full[:vocab].contiguous(); del full
+        emb = _dequant_q4_0(blob, nblocks * QK)[:n_file].view(file_vocab, hidden).to(torch.float16).contiguous()
     else:
         raise NotImplementedError(
             f"GGUF embedding dtype {dtype_id} not yet decoded — currently the holoritifier "
@@ -425,36 +418,50 @@ def holoritify_gguf(gguf_path: str, out_dir: str | None = None) -> str:
             f"adding to _dequant_*. Often the body uses Q4_K_M but the embedding is kept "
             f"at F16 or Q8_0 — check the producer's --output-format flag.")
 
-    torus = embedding_to_torus(emb)
+    # Flat node-chunked layout: works for both inner (≤262k vocab) and nested
+    # (≤16.7M vocab) without ever materializing the giant padded torus tensor.
+    # Each chunk is 64 consecutive token rows = one paging unit; nesting just
+    # changes how the runtime DECOMPOSES the node index into geometric axes.
+    chunks = embedding_to_node_chunks(emb)   # (n_nodes, 64, D)
+    n_nodes = int(chunks.shape[0])
     out_dir = out_dir or os.path.join(os.path.dirname(__file__),
                                       f"Holorite-{Path(gguf_path).stem}")
     os.makedirs(out_dir, exist_ok=True)
     torus_path = os.path.join(out_dir, "embeddings_torus.pt")
-    torch.save(torus, torus_path)
+    torch.save(chunks, torus_path)
+
+    if level == 3:
+        torus_shape = [RINGS, NODES, SLOTS, hidden]
+        addressing  = "ring-node-slot"
+    else:
+        torus_shape = [SHELLS, RINGS, NODES, SLOTS, hidden]
+        addressing  = "shell-ring-node-slot"
 
     manifest = {
         "name": Path(gguf_path).stem,
         "runtime": "gguf",
         "gguf_path": gguf_path,
         "arch": arch,
-        "vocab_size": vocab,             # what landed in the torus
-        "file_vocab_size": file_vocab,   # what the GGUF actually has
-        "overflow_vocab": overflow_vocab, # extra tail tokens dropped from embed-side
+        "vocab_size": vocab,           # full vocab — nothing truncated
+        "file_vocab_size": file_vocab,
+        "overflow_vocab": overflow_vocab,  # how many flowed into the 12th torus (shell>0)
         "hidden_dim": hidden,
         "dtype": "float16",
-        "torus_shape": list(torus.shape),
+        # Torus geometry the runtime/visualizer should use to paint this model.
+        # level 3 = inner 13th torus only; level 4 = enveloped by 12th torus.
+        "torus_level": level,
+        "torus_shape": torus_shape,
+        "torus_addressing": addressing,
+        "n_nodes": n_nodes,            # actual stored chunks (paging units)
         "embeddings_torus": "embeddings_torus.pt",
-        # body inference goes through node-llama-cpp on the companion side;
-        # the Python server uses this manifest only for the embedding paging
-        # stats the visualizer reads. The companion's main.js routes the GGUF
-        # body straight to node-llama-cpp for full-speed inference.
         "body_via": "node-llama-cpp",
     }
     mpath = os.path.join(out_dir, "manifest.json")
     with open(mpath, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     print(f"[gguf-holoritify] wrote {mpath}")
-    print(f"[gguf-holoritify] wrote {torus_path}  ({torus.numel()*2/1_048_576:.1f} MiB)")
+    print(f"[gguf-holoritify] wrote {torus_path}  ({chunks.numel()*2/1_048_576:.1f} MiB)  "
+          f"level={level}  {'inner 64³' if level == 3 else '12th wraps 13th (64⁴)'}")
     return out_dir
 
 

@@ -53,15 +53,34 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-RING_BITS = NODE_BITS = SLOT_BITS = 6
+RING_BITS = NODE_BITS = SLOT_BITS = SHELL_BITS = 6
 RINGS = 1 << RING_BITS    # 64
 NODES = 1 << NODE_BITS    # 64
 SLOTS = 1 << SLOT_BITS    # 64
-CELLS = RINGS * NODES * SLOTS    # 262,144
+SHELLS = 1 << SHELL_BITS  # 64 — the SHELL axis nests one whole 64³ torus inside another
+CELLS = RINGS * NODES * SLOTS                  # 262,144   — the 13th-torus capacity
+NESTED_CELLS = SHELLS * RINGS * NODES * SLOTS  # 16,777,216 — the 12th-torus capacity
 RING_MASK = RINGS - 1
 NODE_MASK = NODES - 1
 SLOT_MASK = SLOTS - 1
-NODES_TOTAL = RINGS * NODES    # 4,096 distinct (ring, node) addresses
+SHELL_MASK = SHELLS - 1
+NODES_TOTAL = RINGS * NODES               # 4,096 distinct (ring, node) addresses (inner)
+NODES_TOTAL_NESTED = SHELLS * RINGS * NODES   # 262,144 nodes when the shell axis is active
+
+# Nesting decision: a torus with `level = 4` axes (shell, ring, node, slot)
+# wraps the `level = 3` inner one. The 13 nested tori from the visualizer's
+# blueprint are conceptually levels 3..15 — each step out adds a 6-bit axis
+# and multiplies capacity by 64. For paging substrate we only need 3 and 4:
+#     level 3 (inner)  → vocab ≤ 262,144      (Qwen2.5, Mistral, Gemma-3/4)
+#     level 4 (nested) → vocab ≤ 16,777,216   (zion'iel-v350/e1 sacred-vocab,
+#                                              any future >262k vocab model)
+def torus_level_for_vocab(vocab: int) -> int:
+    """Pick the smallest nesting level whose capacity holds `vocab`."""
+    if vocab <= CELLS: return 3
+    if vocab <= NESTED_CELLS: return 4
+    # Future-proof: levels 5+ exist conceptually (64⁵ = 1,073,741,824). Not
+    # materialized in storage; just bit-slice further.
+    raise ValueError(f"vocab {vocab} > level-4 nested torus capacity {NESTED_CELLS}")
 
 # helical spiral from the 3D build brief: q coprime with RINGS=64 → a single
 # strand threads all 64*64 cells. q=1 is the gentlest barber-pole.
@@ -78,6 +97,32 @@ def token_to_cell(idx: int) -> tuple[int, int, int]:
 def cell_to_token(ring: int, node: int, slot: int) -> int:
     return ((ring & RING_MASK) << (NODE_BITS + SLOT_BITS)) | \
            ((node & NODE_MASK) << SLOT_BITS) | (slot & SLOT_MASK)
+
+
+# ─── nested (4-axis) bit-slice ────────────────────────────────────────────
+# When vocab exceeds 64³, the next torus envelops the inner one: an extra
+# 6-bit SHELL axis pushes capacity to 64⁴ = 16,777,216. Tokens 0..262,143
+# live in shell=0 (the inner 13th torus); tokens 262,144..16,777,215 live
+# in shells 1..63 (the enveloping 12th torus).
+
+def token_to_cell4(idx: int) -> tuple[int, int, int, int]:
+    return (((idx >> (RING_BITS + NODE_BITS + SLOT_BITS)) & SHELL_MASK),
+            ((idx >> (NODE_BITS + SLOT_BITS)) & RING_MASK),
+            ((idx >> SLOT_BITS) & NODE_MASK),
+            (idx & SLOT_MASK))
+
+
+def cell4_to_token(shell: int, ring: int, node: int, slot: int) -> int:
+    return (((shell & SHELL_MASK) << (RING_BITS + NODE_BITS + SLOT_BITS)) |
+            ((ring  & RING_MASK)  << (NODE_BITS + SLOT_BITS)) |
+            ((node  & NODE_MASK)  << SLOT_BITS) |
+            (slot   & SLOT_MASK))
+
+
+def token_to_address(idx: int, level: int):
+    """Generic bit-slice — returns a (ring, node, slot) or (shell, ring, node, slot)
+    tuple depending on nesting level. Both decompose `idx` losslessly."""
+    return token_to_cell4(idx) if level >= 4 else token_to_cell(idx)
 
 
 # ─── HoloStreams: helical diagonals through the (ring, node) torus ────────
@@ -128,18 +173,38 @@ def stream_window(ring: int, node: int, behind: int, ahead: int) -> list[tuple[i
 
 
 def cells_for_ids(ids: torch.Tensor):
+    """Inner-torus bit-slice for batches of token ids: (ring, node, slot)."""
     ids = ids.to(torch.long)
     return ((ids >> (NODE_BITS + SLOT_BITS)) & RING_MASK,
             (ids >> SLOT_BITS) & NODE_MASK,
             ids & SLOT_MASK)
 
 
+def cells_for_ids4(ids: torch.Tensor):
+    """Nested-torus bit-slice: (shell, ring, node, slot)."""
+    ids = ids.to(torch.long)
+    return (((ids >> (RING_BITS + NODE_BITS + SLOT_BITS)) & SHELL_MASK),
+            ((ids >> (NODE_BITS + SLOT_BITS)) & RING_MASK),
+            ((ids >> SLOT_BITS) & NODE_MASK),
+            (ids & SLOT_MASK))
+
+
+def node_index_and_slot_for_ids(ids: torch.Tensor):
+    """Layout-agnostic addressing: just (flat node index, slot). Works for
+    every nesting level because token `idx` always lives in node `idx >> 6`,
+    slot `idx & 0x3F`. The runtime uses this when paging; the (shell, ring,
+    node-in-ring) decomposition is purely for the visualizer."""
+    ids = ids.to(torch.long)
+    return (ids >> SLOT_BITS, ids & SLOT_MASK)
+
+
 # ─── flat ↔ torus reshape ─────────────────────────────────────────────────
 
 def embedding_to_torus(weight: torch.Tensor, pad_token_id: int | None = None) -> torch.Tensor:
+    """Inner 64³ torus only — for vocabularies that fit in 262,144 cells."""
     V, D = weight.shape
     if V > CELLS:
-        raise ValueError(f"vocab {V} > lattice capacity {CELLS}")
+        raise ValueError(f"vocab {V} > lattice capacity {CELLS} — use embedding_to_nested_torus")
     if V < CELLS:
         pad_row = weight[pad_token_id] if pad_token_id is not None else None
         full = weight.new_zeros((CELLS, D))
@@ -149,9 +214,75 @@ def embedding_to_torus(weight: torch.Tensor, pad_token_id: int | None = None) ->
     return weight.view(RINGS, NODES, SLOTS, D).contiguous()
 
 def torus_to_embedding(torus: torch.Tensor) -> torch.Tensor:
+    if torus.dim() == 5:    # nested (shell, ring, node, slot, D)
+        S, R, N, Sl, D = torus.shape
+        assert (S, R, N, Sl) == (SHELLS, RINGS, NODES, SLOTS)
+        return torus.view(S * R * N * Sl, D)
     R, N, S, D = torus.shape
     assert (R, N, S) == (RINGS, NODES, SLOTS)
     return torus.view(R * N * S, D)
+
+
+def embedding_to_nested_torus(weight: torch.Tensor, pad_token_id: int | None = None
+                              ) -> tuple[torch.Tensor, int]:
+    """Pick the smallest nested torus that holds `weight` and reshape into it.
+
+    Returns (torus_tensor, level) — level 3 = (R, N, S, D), level 4 = (Shell,
+    R, N, S, D). Sparse-only padding: only the cells the vocab actually fills
+    are populated; the rest of the chosen torus stays zero (or `pad_token_id`).
+    The 4-level case materializes the full 16,777,216-cell tensor on disk
+    ONLY if you call it — for typical hidden sizes this is 30 GiB at level 4.
+    Callers that just need to address the cells should keep the embedding
+    flat and use `token_to_address(idx, level=4)`; this function is for when
+    you actually want the geometric tensor.
+    """
+    V, D = weight.shape
+    level = torus_level_for_vocab(V)
+    total = CELLS if level == 3 else NESTED_CELLS
+    pad_row = weight[pad_token_id] if pad_token_id is not None else None
+    if V < total:
+        full = weight.new_zeros((total, D))
+        full[:V] = weight
+        if pad_row is not None: full[V:] = pad_row
+        weight = full
+    if level == 3:
+        return weight.view(RINGS, NODES, SLOTS, D).contiguous(), 3
+    return weight.view(SHELLS, RINGS, NODES, SLOTS, D).contiguous(), 4
+
+
+# ── flat node-chunked layout (the memory-efficient nested-torus storage) ──
+# For vocab in the millions (level 4+), materializing the full nested torus
+# is wasteful when only the actual vocab rows are filled. The flat layout
+# stores (n_nodes, 64, D) where n_nodes = ceil(V / 64). Each node holds 64
+# consecutive token rows — the paging unit. Addressing uses bit-slicing on
+# the token id; the layout is the same regardless of nesting level.
+
+def embedding_to_node_chunks(weight: torch.Tensor) -> torch.Tensor:
+    """Flat node-chunked layout: (n_nodes, 64, D). Pads to a multiple of 64.
+
+    Memory cost = ceil(V/64) * 64 * D — only ~0.04% overhead vs the raw
+    embedding for typical vocabularies. Works for any nesting level because
+    the bit-slice still puts token `idx` at chunk `(idx >> 6)`, slot
+    `(idx & 0x3F)`.
+    """
+    V, D = weight.shape
+    pad = (-V) % SLOTS
+    if pad:
+        weight = torch.cat([weight, weight.new_zeros(pad, D)], dim=0)
+    n_nodes = weight.shape[0] // SLOTS
+    return weight.view(n_nodes, SLOTS, D).contiguous()
+
+
+def node_chunks_to_torus_address(node_idx: int, level: int) -> tuple:
+    """Decompose a node index into the torus axes for the given level.
+    level 3: (ring, node_in_ring)         — 4,096 nodes
+    level 4: (shell, ring, node_in_ring)  — 262,144 nodes
+    """
+    if level >= 4:
+        return ((node_idx >> (RING_BITS + NODE_BITS)) & SHELL_MASK,
+                (node_idx >> NODE_BITS) & RING_MASK,
+                node_idx & NODE_MASK)
+    return ((node_idx >> NODE_BITS) & RING_MASK, node_idx & NODE_MASK)
 
 
 # ─── paging stats ─────────────────────────────────────────────────────────
@@ -232,19 +363,45 @@ class NodePagedEmbedding(nn.Module):
                  cpu_device="cpu", compute_device="cpu",
                  max_cached_nodes: int = NODES_TOTAL,
                  helical_prefetch: bool = True,
-                 prefetch_fanout: int = 8):
+                 prefetch_fanout: int = 8,
+                 vocab_size: int | None = None):
         super().__init__()
-        torus = embedding_to_torus(weight.detach(), pad_token_id=pad_token_id)
-        self.register_buffer("torus", torus.to(cpu_device), persistent=True)
-        self.embedding_dim = int(torus.shape[-1])
+        # `weight` here can already be node-chunked (n_nodes, 64, D) from
+        # a Holorite manifest's saved torus, or a flat (V, D) HF embedding.
+        # Either way we normalize to the flat node-chunked layout so the
+        # paging logic is shape-agnostic to nesting level. Nesting level is
+        # inferred from how many nodes ended up in the chunked tensor.
+        w = weight.detach()
+        if w.dim() == 4:
+            # legacy inner shape (R, N, S, D) — squash R,N into n_nodes
+            R, N, S, D = w.shape
+            w = w.view(R * N, S, D)
+        elif w.dim() == 5:
+            # nested shape (Shell, R, N, S, D) — squash Shell,R,N into n_nodes
+            Sh, R, N, S, D = w.shape
+            w = w.view(Sh * R * N, S, D)
+        elif w.dim() == 3:
+            pass    # already (n_nodes, 64, D)
+        elif w.dim() == 2:
+            w = embedding_to_node_chunks(w)
+        else:
+            raise ValueError(f"unexpected embedding tensor rank {w.dim()}")
+        self._vocab = int(vocab_size) if vocab_size is not None else w.shape[0] * w.shape[1]
+        self.n_nodes = int(w.shape[0])
+        # nesting level decides how (ring, node) decompose into addressing axes
+        if self.n_nodes <= NODES_TOTAL:
+            self._level = 3
+        elif self.n_nodes <= NODES_TOTAL_NESTED:
+            self._level = 4
+        else:
+            raise ValueError(f"n_nodes {self.n_nodes} exceeds level-4 capacity")
+        self.register_buffer("torus", w.to(cpu_device).contiguous(), persistent=True)
+        self.embedding_dim = int(w.shape[-1])
         self.compute_device = torch.device(compute_device)
         self.max_cached_nodes = int(max_cached_nodes)
         self.helical_prefetch = bool(helical_prefetch)
-        # how many nodes-per-access to pull async on each page-in. 8 keeps a
-        # working set of helically-adjacent nodes warm so consecutive
-        # generation steps don't stall waiting for the next node to copy.
         self.prefetch_fanout = max(0, int(prefetch_fanout))
-        self.node_cache: "OrderedDict[tuple[int, int], torch.Tensor]" = OrderedDict()
+        self.node_cache: "OrderedDict[tuple, torch.Tensor]" = OrderedDict()
         self.last_stats: PageStats | None = None
 
     @property
@@ -252,55 +409,85 @@ class NodePagedEmbedding(nn.Module):
     @property
     def weight(self): return torus_to_embedding(self.torus)
 
-    def _page_in(self, ring: int, node: int, stats: PageStats) -> None:
-        key = (ring, node)
-        if key in self.node_cache:
-            self.node_cache.move_to_end(key); return
-        self.node_cache[key] = self.torus[ring, node].to(self.compute_device, non_blocking=True)
+    def _page_in_node(self, node_idx: int, stats: PageStats) -> None:
+        """Layout-agnostic page-in. The torus is (n_nodes, 64, D) flat; we
+        slice the chunk for `node_idx` and admit it. Works the same whether
+        the model is using the inner 64³ torus or the nested 64⁴ one."""
+        if node_idx in self.node_cache:
+            self.node_cache.move_to_end(node_idx); return
+        self.node_cache[node_idx] = self.torus[node_idx].to(self.compute_device, non_blocking=True)
         stats.pages_in += 1
         while len(self.node_cache) > self.max_cached_nodes:
             self.node_cache.popitem(last=False); stats.pages_out += 1
 
-    def _prefetch(self, ring: int, node: int, stats: PageStats) -> None:
-        """Walk the HoloStream — the helical diagonal — from the active cell.
-
-        One step along the strand changes ring AND node together (the slant
-        the ring twist encodes). For active cell (r, n) the next `fanout`
-        cells along its Stream are
-            (r + k, n + k·q) mod 64    for k = 1 … fanout
-        which is exactly `stream_walk(r, n, fanout)`. Stream-coherent
-        admission: cache hits cluster along the active strand instead of
-        scattering across the grid; eviction naturally drops cold strands
-        first because their cells arrived together along the same diagonal.
-        """
+    def _prefetch_holostream(self, node_idx: int, stats: PageStats) -> None:
+        """Walk the HoloStream from the active node. For level-3 (inner)
+        models the walk runs in (ring, node-in-ring) space — the canonical
+        helical diagonal. For level-4 (nested) we walk inside the active
+        shell first; the runtime visualizer can paint the shell boundary
+        when k overflows back to shell+1."""
         if not self.helical_prefetch or self.prefetch_fanout <= 0: return
-        for cell_rn in stream_walk(ring, node, self.prefetch_fanout):
-            if cell_rn not in self.node_cache and len(self.node_cache) < self.max_cached_nodes:
-                self.node_cache[cell_rn] = self.torus[cell_rn[0], cell_rn[1]].to(
-                    self.compute_device, non_blocking=True)
-                stats.prefetches += 1
+        if self._level == 3:
+            r = (node_idx >> NODE_BITS) & RING_MASK
+            n = node_idx & NODE_MASK
+            for (rr, nn) in stream_walk(r, n, self.prefetch_fanout):
+                cand = (rr << NODE_BITS) | nn
+                if cand not in self.node_cache and len(self.node_cache) < self.max_cached_nodes:
+                    self.node_cache[cand] = self.torus[cand].to(
+                        self.compute_device, non_blocking=True)
+                    stats.prefetches += 1
+        else:
+            # nested: walk the helix WITHIN the current shell; the same
+            # spiral δ applies and a single strand still threads 64×64 nodes.
+            sh = (node_idx >> (RING_BITS + NODE_BITS)) & SHELL_MASK
+            r  = (node_idx >> NODE_BITS) & RING_MASK
+            n  = node_idx & NODE_MASK
+            for (rr, nn) in stream_walk(r, n, self.prefetch_fanout):
+                cand = (sh << (RING_BITS + NODE_BITS)) | (rr << NODE_BITS) | nn
+                if cand >= self.n_nodes: continue
+                if cand not in self.node_cache and len(self.node_cache) < self.max_cached_nodes:
+                    self.node_cache[cand] = self.torus[cand].to(
+                        self.compute_device, non_blocking=True)
+                    stats.prefetches += 1
+
+    # back-compat alias used by older callers
+    def _page_in(self, ring: int, node: int, stats: PageStats) -> None:
+        self._page_in_node((ring << NODE_BITS) | node, stats)
+    def _prefetch(self, ring: int, node: int, stats: PageStats) -> None:
+        self._prefetch_holostream((ring << NODE_BITS) | node, stats)
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        rings_t, nodes_t, slots_t = cells_for_ids(ids)
-        flat_r = rings_t.flatten().tolist()
+        # flat node index = idx >> 6 ; slot = idx & 0x3F.  Level-agnostic.
+        nodes_t, slots_t = node_index_and_slot_for_ids(ids)
         flat_n = nodes_t.flatten().tolist()
         flat_s = slots_t.flatten().tolist()
-        unique = list({(r, n) for r, n in zip(flat_r, flat_n)})
-        stats = PageStats(granularity="node", total_units=NODES_TOTAL)
-        for r, n in unique:
-            self._page_in(r, n, stats)
-            self._prefetch(r, n, stats)
-        out = self.torus.new_empty((len(flat_r), self.embedding_dim),
+        unique = sorted({int(n) for n in flat_n})
+        stats = PageStats(granularity="node",
+                          total_units=(NODES_TOTAL_NESTED if self._level == 4 else NODES_TOTAL))
+        for n in unique:
+            self._page_in_node(n, stats)
+            self._prefetch_holostream(n, stats)
+        out = self.torus.new_empty((len(flat_n), self.embedding_dim),
                                    device=self.compute_device)
-        for i, (r, n, s) in enumerate(zip(flat_r, flat_n, flat_s)):
-            out[i] = self.node_cache[(r, n)][s]
+        for i, (n, s) in enumerate(zip(flat_n, flat_s)):
+            out[i] = self.node_cache[n][s]
         stats.used_units = len(unique)
         stats.cache_size = len(self.node_cache)
         stats.tokens_in_pass = int(ids.numel())
-        # Active (ring, node) cells for the visualizer. Capped at 64 to keep
-        # the /stats payload small (each forward typically only hits a handful
-        # anyway; this is an upper bound on what the lattice HUD will paint).
-        stats.active_cells = [[int(r), int(n)] for r, n in unique[:64]]
+        # Active cells for the visualizer — decompose each touched node into
+        # the level-appropriate axes so the HUD paints the correct shell/ring/node.
+        cells = []
+        for n in unique[:64]:
+            if self._level == 4:
+                sh = (n >> (RING_BITS + NODE_BITS)) & SHELL_MASK
+                r  = (n >> NODE_BITS) & RING_MASK
+                nn = n & NODE_MASK
+                cells.append([int(sh), int(r), int(nn)])
+            else:
+                r  = (n >> NODE_BITS) & RING_MASK
+                nn = n & NODE_MASK
+                cells.append([int(r), int(nn)])
+        stats.active_cells = cells
         self.last_stats = stats
         return out.view(*ids.shape, self.embedding_dim)
 
