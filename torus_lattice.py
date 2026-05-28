@@ -53,34 +53,68 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-RING_BITS = NODE_BITS = SLOT_BITS = SHELL_BITS = 6
+RING_BITS = NODE_BITS = SLOT_BITS = 6
 RINGS = 1 << RING_BITS    # 64
 NODES = 1 << NODE_BITS    # 64
 SLOTS = 1 << SLOT_BITS    # 64
-SHELLS = 1 << SHELL_BITS  # 64 — the SHELL axis nests one whole 64³ torus inside another
-CELLS = RINGS * NODES * SLOTS                  # 262,144   — the 13th-torus capacity
-NESTED_CELLS = SHELLS * RINGS * NODES * SLOTS  # 16,777,216 — the 12th-torus capacity
 RING_MASK = RINGS - 1
 NODE_MASK = NODES - 1
 SLOT_MASK = SLOTS - 1
-SHELL_MASK = SHELLS - 1
-NODES_TOTAL = RINGS * NODES               # 4,096 distinct (ring, node) addresses (inner)
-NODES_TOTAL_NESTED = SHELLS * RINGS * NODES   # 262,144 nodes when the shell axis is active
+CELLS = RINGS * NODES * SLOTS                  # 262,144   — one full 64³ torus
+NODES_TOTAL = RINGS * NODES                    # 4,096 nodes per torus
 
-# Nesting decision: a torus with `level = 4` axes (shell, ring, node, slot)
-# wraps the `level = 3` inner one. The 13 nested tori from the visualizer's
-# blueprint are conceptually levels 3..15 — each step out adds a 6-bit axis
-# and multiplies capacity by 64. For paging substrate we only need 3 and 4:
-#     level 3 (inner)  → vocab ≤ 262,144      (Qwen2.5, Mistral, Gemma-3/4)
-#     level 4 (nested) → vocab ≤ 16,777,216   (zion'iel-v350/e1 sacred-vocab,
-#                                              any future >262k vocab model)
+# Matryoshka nesting (Alpha / Omega / Sigma / Tau / …):
+# every nested torus is a *full* 64³ sub-lattice rooted at one cell of the
+# parent. Each envelope step therefore multiplies token capacity by 64³ =
+# 262,144 (NOT by 64 — the earlier single-SHELL impl was wrong on that).
+#
+#     n_tori = 1  (Alpha alone)          : 64^3  =       262,144  tokens
+#     n_tori = 2  (Alpha + Omega)        : 64^6  = 68,719,476,736  tokens
+#     n_tori = 3  (Alpha + Omega + Sigma): 64^9  ≈ 1.8 × 10^19
+#     n_tori = k                         : 64^(3k) = 262,144^k
+#
+# The bit-slice adds 18 bits per envelope (ring₆ + node₆ + slot₆), so a
+# level-k address is 18·k bits laid out OUTERMOST-FIRST in the integer:
+#     [a_{k-1}.r, a_{k-1}.n, a_{k-1}.s,  …,  a_1.r, a_1.n, a_1.s,  a_0.r, a_0.n, a_0.s]
+# Alpha (level 0 in the list, innermost) holds the low 18 bits; each
+# enveloping Omega's anchor is encoded as a triplet at the next 18-bit slice.
+TORUS_BITS = RING_BITS + NODE_BITS + SLOT_BITS   # 18 — bits added per envelope
+TORUS_CELLS = CELLS                              # 262,144 — cells per envelope
+TORUS_MASK  = TORUS_CELLS - 1                    # 0x3FFFF
+TORUS_NODES = NODES_TOTAL                        # 4,096 — nodes per envelope
+NODE_BITS_PER_TORUS = RING_BITS + NODE_BITS      # 12 — node-axis bits per envelope
+
+
 def torus_level_for_vocab(vocab: int) -> int:
-    """Pick the smallest nesting level whose capacity holds `vocab`."""
-    if vocab <= CELLS: return 3
-    if vocab <= NESTED_CELLS: return 4
-    # Future-proof: levels 5+ exist conceptually (64⁵ = 1,073,741,824). Not
-    # materialized in storage; just bit-slice further.
-    raise ValueError(f"vocab {vocab} > level-4 nested torus capacity {NESTED_CELLS}")
+    """Smallest number of nested tori whose capacity holds `vocab`.
+
+    Returns n_tori ∈ {1, 2, 3, …}. n_tori=1 covers any vocab ≤ 262,144
+    (every standard LLM today). n_tori=2 covers up to 68.7 billion tokens
+    (every plausible future vocab). Higher levels are conceptual — the
+    13-torus visualizer blueprint anticipates up to n_tori=13.
+    """
+    if vocab <= 0:
+        return 1
+    n = 1
+    cap = TORUS_CELLS
+    while cap < vocab:
+        n += 1
+        cap *= TORUS_CELLS
+        if n > 13:
+            raise ValueError(f"vocab {vocab} exceeds the 13-torus capacity")
+    return n
+
+
+# ─── back-compat names ────────────────────────────────────────────────────
+# The previous version added a single SHELL axis (24-bit / 64⁴ addressing).
+# That was wrong: it grew capacity by 64× per envelope, not by 262,144× as
+# the geometric description requires. These names are kept so callers don't
+# crash; they map to the new Matryoshka semantics.
+SHELLS = 1   # there is no single-axis SHELL anymore; each envelope is a full torus
+SHELL_MASK = 0
+SHELL_BITS = 0
+NESTED_CELLS = TORUS_CELLS * TORUS_CELLS                   # 64⁶ — n_tori=2 capacity
+NODES_TOTAL_NESTED = TORUS_NODES * TORUS_NODES             # 16,777,216 — n_tori=2 node count
 
 # helical spiral from the 3D build brief: q coprime with RINGS=64 → a single
 # strand threads all 64*64 cells. q=1 is the gentlest barber-pole.
@@ -99,30 +133,83 @@ def cell_to_token(ring: int, node: int, slot: int) -> int:
            ((node & NODE_MASK) << SLOT_BITS) | (slot & SLOT_MASK)
 
 
-# ─── nested (4-axis) bit-slice ────────────────────────────────────────────
-# When vocab exceeds 64³, the next torus envelops the inner one: an extra
-# 6-bit SHELL axis pushes capacity to 64⁴ = 16,777,216. Tokens 0..262,143
-# live in shell=0 (the inner 13th torus); tokens 262,144..16,777,215 live
-# in shells 1..63 (the enveloping 12th torus).
+# ─── Matryoshka bit-slice (Alpha / Omega / Sigma / …) ─────────────────────
+# Each envelope is itself a full 64³ torus rooted at one cell of its parent.
+# An n_tori=k address is 18·k bits; the high 18 bits select which Omega
+# anchor (which Alpha cell roots this Omega), the low 18 bits address
+# within that Omega exactly like an Alpha cell.
+#
+# Returned tuple convention: OUTERMOST FIRST. So for n_tori=2:
+#   token_to_nested_address(idx, 2) =
+#       [(omega_anchor_ring, omega_anchor_node, omega_anchor_slot),
+#        (alpha_ring,        alpha_node,        alpha_slot)]
+# The first triplet identifies which Omega torus you're in (= which Alpha
+# cell roots it); the second triplet is your position inside that Omega.
 
-def token_to_cell4(idx: int) -> tuple[int, int, int, int]:
-    return (((idx >> (RING_BITS + NODE_BITS + SLOT_BITS)) & SHELL_MASK),
-            ((idx >> (NODE_BITS + SLOT_BITS)) & RING_MASK),
-            ((idx >> SLOT_BITS) & NODE_MASK),
-            (idx & SLOT_MASK))
+def _decompose_torus_addr(addr18: int) -> tuple[int, int, int]:
+    return ((addr18 >> (NODE_BITS + SLOT_BITS)) & RING_MASK,
+            (addr18 >> SLOT_BITS) & NODE_MASK,
+            addr18 & SLOT_MASK)
 
 
-def cell4_to_token(shell: int, ring: int, node: int, slot: int) -> int:
-    return (((shell & SHELL_MASK) << (RING_BITS + NODE_BITS + SLOT_BITS)) |
-            ((ring  & RING_MASK)  << (NODE_BITS + SLOT_BITS)) |
-            ((node  & NODE_MASK)  << SLOT_BITS) |
-            (slot   & SLOT_MASK))
+def token_to_nested_address(idx: int, n_tori: int) -> list[tuple[int, int, int]]:
+    """Decompose `idx` into n_tori envelope triplets, outermost first."""
+    out: list[tuple[int, int, int]] = []
+    for level in range(n_tori - 1, -1, -1):
+        chunk = (idx >> (level * TORUS_BITS)) & TORUS_MASK
+        out.append(_decompose_torus_addr(chunk))
+    return out
+
+
+def nested_address_to_token(triplets: list[tuple[int, int, int]]) -> int:
+    """Inverse: reassemble a flat token id from outermost-first triplets."""
+    idx = 0
+    n = len(triplets)
+    for L, (r, n_, s) in enumerate(triplets):
+        depth = n - 1 - L   # 0 = innermost (Alpha)
+        chunk = ((r & RING_MASK) << (NODE_BITS + SLOT_BITS)) | \
+                ((n_ & NODE_MASK) << SLOT_BITS) | (s & SLOT_MASK)
+        idx |= (chunk << (depth * TORUS_BITS))
+    return idx
+
+
+def node_to_nested_address(node_idx: int, n_tori: int) -> list[tuple[int, int]]:
+    """Same as above but at NODE granularity (drops the slot axis on each
+    envelope). For n_tori=2 a node_idx in [0, 4096²) decomposes to
+    [(omega_anchor_ring, omega_anchor_node), (alpha_ring, alpha_node)]."""
+    out: list[tuple[int, int]] = []
+    for level in range(n_tori - 1, -1, -1):
+        chunk = (node_idx >> (level * NODE_BITS_PER_TORUS)) & (TORUS_NODES - 1)
+        out.append(((chunk >> NODE_BITS) & RING_MASK, chunk & NODE_MASK))
+    return out
 
 
 def token_to_address(idx: int, level: int):
-    """Generic bit-slice — returns a (ring, node, slot) or (shell, ring, node, slot)
-    tuple depending on nesting level. Both decompose `idx` losslessly."""
-    return token_to_cell4(idx) if level >= 4 else token_to_cell(idx)
+    """Legacy entry point — `level` may be n_tori (1, 2, 3, …) or the
+    old single-shell levels (3 = Alpha, 4 = Alpha+single-shell).
+    Forwards to the proper Matryoshka helper."""
+    n_tori = 1 if level <= 3 else 2     # legacy 3→1, 4→2; new callers pass n_tori directly
+    if 1 <= level <= 13: n_tori = level if level <= 2 else n_tori
+    return token_to_nested_address(idx, n_tori)
+
+
+# Legacy 4-axis helpers kept for callers that still expect a single SHELL.
+# They now express the same Matryoshka geometry — shell ≡ Omega anchor's
+# slot axis, ring/node/slot ≡ Alpha position — which lines up for the only
+# vocab range where the old impl was used (single-envelope cases).
+def token_to_cell4(idx: int) -> tuple[int, int, int, int]:
+    """Legacy: returns (shell, ring, node, slot). With the new geometry the
+    'shell' is the slot-axis of the Omega anchor — i.e. which of the 64
+    Alpha-cell mailboxes (in the (0,0,*) row) the Omega is rooted at."""
+    triplets = token_to_nested_address(idx, n_tori=2)
+    omega_anchor_slot = triplets[0][2]
+    alpha_r, alpha_n, alpha_s = triplets[1]
+    return (omega_anchor_slot, alpha_r, alpha_n, alpha_s)
+
+
+def cell4_to_token(shell: int, ring: int, node: int, slot: int) -> int:
+    return nested_address_to_token([(0, 0, shell & SLOT_MASK),
+                                    (ring & RING_MASK, node & NODE_MASK, slot & SLOT_MASK)])
 
 
 # ─── HoloStreams: helical diagonals through the (ring, node) torus ────────
@@ -181,12 +268,28 @@ def cells_for_ids(ids: torch.Tensor):
 
 
 def cells_for_ids4(ids: torch.Tensor):
-    """Nested-torus bit-slice: (shell, ring, node, slot)."""
+    """Legacy 4-axis decomposition (shell, ring, node, slot). Now expresses
+    the Matryoshka geometry: shell = the Omega anchor's slot axis (assuming
+    n_tori=2 and anchor is in row (0,0,*) — kept only for back-compat with
+    older callers; new code uses `cells_for_ids_nested`)."""
     ids = ids.to(torch.long)
-    return (((ids >> (RING_BITS + NODE_BITS + SLOT_BITS)) & SHELL_MASK),
-            ((ids >> (NODE_BITS + SLOT_BITS)) & RING_MASK),
-            ((ids >> SLOT_BITS) & NODE_MASK),
-            (ids & SLOT_MASK))
+    return (((ids >> (NODE_BITS + SLOT_BITS + TORUS_BITS)) & SLOT_MASK),   # omega anchor's slot
+            ((ids >> (NODE_BITS + SLOT_BITS)) & RING_MASK),                # alpha ring
+            ((ids >> SLOT_BITS) & NODE_MASK),                              # alpha node
+            (ids & SLOT_MASK))                                              # alpha slot
+
+
+def cells_for_ids_nested(ids: torch.Tensor, n_tori: int):
+    """Vectorized n-level Matryoshka decomposition. Returns a list of
+    (ring, node, slot) tensor triplets, OUTERMOST FIRST."""
+    ids = ids.to(torch.long)
+    out = []
+    for level in range(n_tori - 1, -1, -1):
+        chunk = (ids >> (level * TORUS_BITS)) & TORUS_MASK
+        out.append(((chunk >> (NODE_BITS + SLOT_BITS)) & RING_MASK,
+                    (chunk >> SLOT_BITS) & NODE_MASK,
+                    chunk & SLOT_MASK))
+    return out
 
 
 def node_index_and_slot_for_ids(ids: torch.Tensor):
@@ -388,13 +491,18 @@ class NodePagedEmbedding(nn.Module):
             raise ValueError(f"unexpected embedding tensor rank {w.dim()}")
         self._vocab = int(vocab_size) if vocab_size is not None else w.shape[0] * w.shape[1]
         self.n_nodes = int(w.shape[0])
-        # nesting level decides how (ring, node) decompose into addressing axes
-        if self.n_nodes <= NODES_TOTAL:
-            self._level = 3
-        elif self.n_nodes <= NODES_TOTAL_NESTED:
-            self._level = 4
-        else:
-            raise ValueError(f"n_nodes {self.n_nodes} exceeds level-4 capacity")
+        # n_tori = smallest number of nested 64³ tori whose node space holds n_nodes.
+        # Each torus has 4,096 nodes; nesting multiplies node space by 4,096 per level.
+        # (The 4,096× node-space growth matches the 262,144× cell growth — the third
+        # axis (slot) isn't part of the node addressing, only the cell addressing.)
+        self._n_tori = 1
+        cap_nodes = TORUS_NODES
+        while cap_nodes < self.n_nodes:
+            self._n_tori += 1
+            cap_nodes *= TORUS_NODES
+            if self._n_tori > 13:
+                raise ValueError(f"n_nodes {self.n_nodes} exceeds the 13-torus capacity")
+        self._level = self._n_tori   # exposed for /stats and the visualizer
         self.register_buffer("torus", w.to(cpu_device).contiguous(), persistent=True)
         self.embedding_dim = int(w.shape[-1])
         self.compute_device = torch.device(compute_device)
@@ -421,34 +529,26 @@ class NodePagedEmbedding(nn.Module):
             self.node_cache.popitem(last=False); stats.pages_out += 1
 
     def _prefetch_holostream(self, node_idx: int, stats: PageStats) -> None:
-        """Walk the HoloStream from the active node. For level-3 (inner)
-        models the walk runs in (ring, node-in-ring) space — the canonical
-        helical diagonal. For level-4 (nested) we walk inside the active
-        shell first; the runtime visualizer can paint the shell boundary
-        when k overflows back to shell+1."""
+        """Walk the HoloStream from the active node. The helical walk is
+        *local within the innermost (Alpha) torus the node lives in* — the
+        same spiral δ that threads 64×64 nodes works inside every Omega,
+        Sigma, … because each is a full 64³ sub-lattice with the same
+        topology. Crossing to a sibling Omega torus is "stepping up a level"
+        and the prefetcher doesn't walk across that boundary on its own."""
         if not self.helical_prefetch or self.prefetch_fanout <= 0: return
-        if self._level == 3:
-            r = (node_idx >> NODE_BITS) & RING_MASK
-            n = node_idx & NODE_MASK
-            for (rr, nn) in stream_walk(r, n, self.prefetch_fanout):
-                cand = (rr << NODE_BITS) | nn
-                if cand not in self.node_cache and len(self.node_cache) < self.max_cached_nodes:
-                    self.node_cache[cand] = self.torus[cand].to(
-                        self.compute_device, non_blocking=True)
-                    stats.prefetches += 1
-        else:
-            # nested: walk the helix WITHIN the current shell; the same
-            # spiral δ applies and a single strand still threads 64×64 nodes.
-            sh = (node_idx >> (RING_BITS + NODE_BITS)) & SHELL_MASK
-            r  = (node_idx >> NODE_BITS) & RING_MASK
-            n  = node_idx & NODE_MASK
-            for (rr, nn) in stream_walk(r, n, self.prefetch_fanout):
-                cand = (sh << (RING_BITS + NODE_BITS)) | (rr << NODE_BITS) | nn
-                if cand >= self.n_nodes: continue
-                if cand not in self.node_cache and len(self.node_cache) < self.max_cached_nodes:
-                    self.node_cache[cand] = self.torus[cand].to(
-                        self.compute_device, non_blocking=True)
-                    stats.prefetches += 1
+        # Strip everything above the active Alpha torus; keep the parent
+        # bits as a base offset so the prefetched cells land in the same
+        # Omega/Sigma/etc as the active node.
+        parent_base = node_idx & ~(TORUS_NODES - 1)   # zero out the alpha (ring, node) bits
+        r = (node_idx >> NODE_BITS) & RING_MASK
+        n = node_idx & NODE_MASK
+        for (rr, nn) in stream_walk(r, n, self.prefetch_fanout):
+            cand = parent_base | ((rr << NODE_BITS) | nn)
+            if cand >= self.n_nodes: continue
+            if cand not in self.node_cache and len(self.node_cache) < self.max_cached_nodes:
+                self.node_cache[cand] = self.torus[cand].to(
+                    self.compute_device, non_blocking=True)
+                stats.prefetches += 1
 
     # back-compat alias used by older callers
     def _page_in(self, ring: int, node: int, stats: PageStats) -> None:
@@ -463,7 +563,7 @@ class NodePagedEmbedding(nn.Module):
         flat_s = slots_t.flatten().tolist()
         unique = sorted({int(n) for n in flat_n})
         stats = PageStats(granularity="node",
-                          total_units=(NODES_TOTAL_NESTED if self._level == 4 else NODES_TOTAL))
+                          total_units=TORUS_NODES ** self._n_tori)
         for n in unique:
             self._page_in_node(n, stats)
             self._prefetch_holostream(n, stats)
@@ -474,19 +574,16 @@ class NodePagedEmbedding(nn.Module):
         stats.used_units = len(unique)
         stats.cache_size = len(self.node_cache)
         stats.tokens_in_pass = int(ids.numel())
-        # Active cells for the visualizer — decompose each touched node into
-        # the level-appropriate axes so the HUD paints the correct shell/ring/node.
+        # Active cells for the visualizer — full Matryoshka decomposition,
+        # outermost first. For n_tori=1 each entry is [[ring, node]]; for
+        # n_tori=2 it's [[omega_anchor_ring, omega_anchor_node], [alpha_ring, alpha_node]]
+        # so the renderer can paint inside whichever Omega torus the active
+        # cell sits in.
         cells = []
         for n in unique[:64]:
-            if self._level == 4:
-                sh = (n >> (RING_BITS + NODE_BITS)) & SHELL_MASK
-                r  = (n >> NODE_BITS) & RING_MASK
-                nn = n & NODE_MASK
-                cells.append([int(sh), int(r), int(nn)])
-            else:
-                r  = (n >> NODE_BITS) & RING_MASK
-                nn = n & NODE_MASK
-                cells.append([int(r), int(nn)])
+            triplets = node_to_nested_address(n, self._n_tori)
+            # triplets is outermost-first list of (ring, node) pairs
+            cells.append([list(p) for p in triplets])
         stats.active_cells = cells
         self.last_stats = stats
         return out.view(*ids.shape, self.embedding_dim)

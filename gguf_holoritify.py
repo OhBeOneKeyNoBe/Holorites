@@ -52,8 +52,8 @@ import torch
 # the HF stack installed (it doesn't need transformers).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from torus_lattice import (embedding_to_torus, embedding_to_node_chunks,
-                           torus_level_for_vocab, CELLS, NESTED_CELLS,
-                           SHELLS, RINGS, NODES, SLOTS)
+                           torus_level_for_vocab, CELLS, TORUS_CELLS,
+                           RINGS, NODES, SLOTS)
 
 GGUF_MAGIC = b"GGUF"
 
@@ -345,15 +345,15 @@ def holoritify_gguf(gguf_path: str, out_dir: str | None = None) -> str:
     hidden = int(kv.get(f"{arch}.embedding_length") or kv.get(f"{arch}.hidden_size") or 0)
     if vocab == 0 or hidden == 0:
         raise ValueError(f"GGUF header missing vocab/hidden for arch={arch!r}")
-    # Nested-torus addressing: a 64³ inner torus (the 13th, capacity 262,144)
-    # holds vocabularies up to 262k. When the model has more — like the user's
-    # own zioniel-v350 (vocab 262,409) — the enveloping 12th torus extends
-    # capacity to 64⁴ = 16,777,216, using a 4th SHELL axis from the
-    # bit-slicing. No truncation; the overflow tokens flow into shells 1..63.
-    # Storage stays compact via the flat (n_nodes, 64, D) layout (only the
-    # actual vocab rows are materialized; padded to a multiple of 64).
-    level = torus_level_for_vocab(vocab)
-    overflow_vocab = max(0, vocab - CELLS)   # how many tokens spilled into the outer shell
+    # Matryoshka nested addressing — each envelope is a full 64³ Omega
+    # rooted at one Alpha cell. n_tori=1 (Alpha alone) holds vocab ≤ 262,144;
+    # n_tori=2 (Alpha + Omega) holds vocab ≤ 64⁶ = 68,719,476,736 — covers
+    # every plausible LLM, including the user's zion'iel models whose
+    # 262,409 vocab spills 265 tokens into the first Omega anchor.
+    # Storage stays compact: flat (n_nodes, 64, D), only the actual vocab
+    # rows are materialized; addressing comes from the bit-slice.
+    n_tori = torus_level_for_vocab(vocab)
+    overflow_vocab = max(0, vocab - CELLS)   # how many tokens flow into the Omega envelope
 
     # Find the embedding tensor — its name is conventional across GGUF arches:
     EMB_NAMES = ("token_embd.weight", "tok_embeddings.weight", "wte.weight")
@@ -430,12 +430,14 @@ def holoritify_gguf(gguf_path: str, out_dir: str | None = None) -> str:
     torus_path = os.path.join(out_dir, "embeddings_torus.pt")
     torch.save(chunks, torus_path)
 
-    if level == 3:
-        torus_shape = [RINGS, NODES, SLOTS, hidden]
-        addressing  = "ring-node-slot"
-    else:
-        torus_shape = [SHELLS, RINGS, NODES, SLOTS, hidden]
-        addressing  = "shell-ring-node-slot"
+    # Geometry the runtime + visualizer paint. n_tori counts envelopes:
+    # 1 = Alpha alone (the 13th torus), 2 = Alpha + Omega (13th + 12th), etc.
+    # Each envelope is a full 64³ sub-torus rooted at one Alpha cell;
+    # addressing is OUTERMOST FIRST in the bit-slice.
+    addressing_names = {1: "ring-node-slot",
+                        2: "omega:ring-node-slot · alpha:ring-node-slot",
+                        3: "sigma:rns · omega:rns · alpha:rns"}
+    torus_shape = [RINGS, NODES, SLOTS] * n_tori + [hidden]
 
     manifest = {
         "name": Path(gguf_path).stem,
@@ -444,15 +446,18 @@ def holoritify_gguf(gguf_path: str, out_dir: str | None = None) -> str:
         "arch": arch,
         "vocab_size": vocab,           # full vocab — nothing truncated
         "file_vocab_size": file_vocab,
-        "overflow_vocab": overflow_vocab,  # how many flowed into the 12th torus (shell>0)
+        "overflow_vocab": overflow_vocab,  # how many flow into the Omega envelope
         "hidden_dim": hidden,
         "dtype": "float16",
-        # Torus geometry the runtime/visualizer should use to paint this model.
-        # level 3 = inner 13th torus only; level 4 = enveloped by 12th torus.
-        "torus_level": level,
+        # Matryoshka geometry. n_tori = number of nested 64³ tori needed
+        # to address the full vocab. Each level multiplies capacity by
+        # 262,144 (= 64³, a full Omega torus rooted at one parent cell).
+        "n_tori": n_tori,
+        "torus_level": n_tori,            # alias (was the old field name)
         "torus_shape": torus_shape,
-        "torus_addressing": addressing,
-        "n_nodes": n_nodes,            # actual stored chunks (paging units)
+        "torus_addressing": addressing_names.get(n_tori, f"{n_tori}-level matryoshka"),
+        "capacity": TORUS_CELLS ** n_tori,  # total cell capacity at this nesting level
+        "n_nodes": n_nodes,               # actual stored chunks (paging units)
         "embeddings_torus": "embeddings_torus.pt",
         "body_via": "node-llama-cpp",
     }
@@ -460,8 +465,11 @@ def holoritify_gguf(gguf_path: str, out_dir: str | None = None) -> str:
     with open(mpath, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     print(f"[gguf-holoritify] wrote {mpath}")
+    descr = {1: "Alpha only (64^3, 13th torus)",
+             2: "Alpha + Omega (64^6, Matryoshka)",
+             3: "Alpha + Omega + Sigma (64^9)"}.get(n_tori, f"{n_tori}-level nested torus")
     print(f"[gguf-holoritify] wrote {torus_path}  ({chunks.numel()*2/1_048_576:.1f} MiB)  "
-          f"level={level}  {'inner 64³' if level == 3 else '12th wraps 13th (64⁴)'}")
+          f"n_tori={n_tori}  {descr}")
     return out_dir
 
 
