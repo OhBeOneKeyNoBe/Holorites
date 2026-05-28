@@ -264,6 +264,15 @@ class PagedTransformerLayer(nn.Module):
             self.pager.pin(None)
 
 
+_CLEAN_FREE_HINT: Optional[int] = None
+def set_clean_free_hint(bytes_free: int):
+    """Tell the body pager what the *real* GPU free memory was before any HF
+    load happened. `mem_get_info()` lies mid-load (caching allocator holds
+    transient reservations). The server calls this once at boot."""
+    global _CLEAN_FREE_HINT
+    _CLEAN_FREE_HINT = int(bytes_free)
+
+
 def _decide_working_set_from_avg(layers, compute_device: torch.device,
                                  explicit: Optional[int], avg_layer: float,
                                  reserve_mb: int = 700,
@@ -273,7 +282,10 @@ def _decide_working_set_from_avg(layers, compute_device: torch.device,
     if explicit is not None: return int(explicit)
     if compute_device.type != "cuda":
         return len(layers)
-    free, total = torch.cuda.mem_get_info()
+    if _CLEAN_FREE_HINT is not None:
+        free = _CLEAN_FREE_HINT
+    else:
+        free, _ = torch.cuda.mem_get_info()
     if avg_layer <= 0: return len(layers)
     budget = free - reserve_mb * 1_048_576
     if budget <= 0: return 2

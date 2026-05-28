@@ -23,6 +23,29 @@ HOST, PORT = "127.0.0.1", 41511
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 
+# Snapshot the device's clean free memory ONCE at startup, when no model is
+# loaded. `torch.cuda.mem_get_info()` lies during HF `from_pretrained` because
+# the load transient briefly pins weights on the GPU and the caching allocator
+# holds those reservations even after `low_cpu_mem_usage=True` moves them to
+# CPU. Reading free memory mid-load showed us 321 MiB on a 4 GiB card — way
+# under the real budget. Capturing it now gives us a stable reference.
+if DEVICE == "cuda":
+    # ensure CUDA is initialized before mem_get_info — otherwise it can
+    # report a stale low value before the first tensor lands on the device.
+    _ = torch.empty(1, device="cuda")
+    del _
+    torch.cuda.synchronize()
+    _CLEAN_FREE, _DEV_TOTAL = torch.cuda.mem_get_info()
+    print(f"[holorite] clean GPU snapshot: free={_CLEAN_FREE/1_048_576:.0f} MiB of {_DEV_TOTAL/1_048_576:.0f} MiB", flush=True)
+else:
+    _CLEAN_FREE, _DEV_TOTAL = 1 << 40, 1 << 40
+
+# Share the clean snapshot with body_pager so its own working-set decision
+# uses the truth instead of the lying-mid-load mem_get_info value.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import body_pager as _body_pager_module
+_body_pager_module.set_clean_free_hint(_CLEAN_FREE)
+
 # very small in-process cache so picking the same Holorite twice doesn't
 # re-load the whole model each chat. {manifest_path: (tok, model, paged_emb)}
 _loaded_lock = threading.Lock()
@@ -91,25 +114,33 @@ def load_holorite(manifest_path: str):
         body_layers = _iter_body_layers(model)
         avg_layer_fp16 = sum(_layer_cpu_bytes(l) for l in body_layers) / max(len(body_layers), 1)
         n_layers = len(body_layers)
-        if DEVICE == "cuda":
-            free_now, _ = torch.cuda.mem_get_info()
-        else:
-            free_now = 1 << 40
-        body_budget = max(0, free_now - 900 * 1_048_576)   # 900 MiB reserve for lm_head/embed/activations/KV
+        # Use the *clean* GPU snapshot taken at server startup, not the live
+        # value — `mem_get_info` reports 321 MiB mid-HF-load even when the
+        # actual usable budget is ~3.5 GiB (caching-allocator stickiness from
+        # the transient that `low_cpu_mem_usage` placed on the GPU and then
+        # supposedly moved off). The clean snapshot is the truth.
+        free_now = _CLEAN_FREE if DEVICE == "cuda" else (1 << 40)
+        body_budget = max(0, free_now - 250 * 1_048_576)   # 250 MiB reserve — user's other apps already eat most of the 4 GiB
         # Explicit user override always wins
         int8_master = bool(int(os.environ.get("HOLORITE_INT8_BODY", "0")))
         if man.get("int8_body") is True: int8_master = True
         elif man.get("int8_body") is False: int8_master = False
         else:
             # auto: engage int8 only when fp16 whole-body would substantially
-            # overflow the budget (margin 1.25× to absorb PyTorch's caching-
-            # allocator stickiness; without the margin, the 1.5B kept tripping
-            # int8 because the 0.5B's evicted reservations hadn't released yet).
-            int8_master = (n_layers * avg_layer_fp16) > (body_budget * 1.25)
+            # overflow the budget (margin 1.6× absorbs PyTorch's caching-
+            # allocator stickiness AND the model-load transient that briefly
+            # touched GPU before low_cpu_mem_usage moved things to CPU).
+            int8_master = (n_layers * avg_layer_fp16) > (body_budget * 1.6)
         # working_set=None → auto-size in paged_body, with round-up to whole body
         # when ≥85% would fit (so small models hold everything, no churn).
+        # reserve_mb=250 mirrors the budget calc above — user's GPU is shared
+        # with other apps so we keep the reserve tight.
+        print(f"[holorite-debug] free_now={free_now/1_048_576:.0f} MiB · "
+              f"body_fp16_total={n_layers*avg_layer_fp16/1_048_576:.0f} MiB · "
+              f"body_budget={body_budget/1_048_576:.0f} MiB · "
+              f"int8_master={int8_master}", flush=True)
         n_wrapped, ws = paged_body(model, compute_device=DEVICE, prefetch=True,
-                                   working_set=None, prefetch_fanout=8, reserve_mb=900,
+                                   working_set=None, prefetch_fanout=8, reserve_mb=250,
                                    int8_master=int8_master)
         if ws >= n_wrapped:
             mode = f"all {n_wrapped} layers fit (no eviction)"
