@@ -396,8 +396,11 @@ class Handler(BaseHTTPRequestHandler):
                           "saved_mb": round((full_emb_bytes - on_gpu) / 1_048_576, 1),
                           # active (ring, node) cells for the 13th-torus visualizer
                           "active_cells": s.active_cells or []})
-        global _last_chat_stats
-        _last_chat_stats = stats
+        # _last_chat_stats was already declared global at the top of the
+        # /announce branch above; re-declaring it here is a SyntaxError in
+        # Python 3.12 ("name '_last_chat_stats' is used prior to global
+        # declaration"). One declaration covers the whole do_POST scope.
+        _last_chat_stats = stats   # noqa: F823 — global already declared above
         return self._send_json(200, {"text": reply, "stats": stats})
 
 
