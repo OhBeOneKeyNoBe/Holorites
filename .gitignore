@@ -10,3 +10,8 @@ __pycache__/
 .idea/
 .vscode/
 *.log
+
+# Streamer asset trees — multi-GB chunked .npy outputs from chunkify_model().
+# These are tests/data, not source. Keep them off the repo.
+stream-*/
+*.npy

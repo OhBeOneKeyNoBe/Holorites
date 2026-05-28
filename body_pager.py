@@ -148,6 +148,77 @@ def _int8_dequantize(q: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype,
     return q_dev * s_dev
 
 
+# ── int4 (the real lever for 7B chat speed) ───────────────────────────────
+#
+# 4 bits per weight = 8× less PCIe than fp16, 2× less than int8. The whole
+# 7B body lands in ~1.75 GiB instead of 14 GiB; it can fit on the GPU
+# entirely (no paging at all) on a 4 GiB card with room to spare.
+#
+# Encoding: pack two signed-int4 values per uint8 byte. Range [-7, +7] (one
+# code reserved to keep symmetric range, common in GGUF Q4_0). Per-output-
+# row fp16 scale (max abs / 7).
+
+INT4_GROUP = 64   # GGUF Q4_0-style: one fp16 scale per 64 input elements
+
+def _int4_quantize(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-group int4 quantization, packed two-per-byte, groups of 64 along
+    the inner dim — GGUF Q4_0 layout. Returns ((packed_uint8, meta), scales).
+    Tiny tensors stay full-precision."""
+    if t.dim() < 2 or t.numel() < 2048:
+        return t.detach().contiguous(), None  # type: ignore[return-value]
+    orig_shape = list(t.shape)
+    # Flatten everything except the OUT dim → (out, in)
+    out = orig_shape[0]
+    flat = t.detach().to(torch.float32).contiguous().view(out, -1)
+    in_dim = flat.shape[1]
+    # pad the inner dim to a multiple of the group size
+    pad = (-in_dim) % INT4_GROUP
+    if pad: flat = torch.cat([flat, torch.zeros(out, pad, dtype=torch.float32)], dim=1)
+    padded = flat.shape[1]
+    n_groups = padded // INT4_GROUP
+    # Per-group max → per-group scale.  shape: (out, n_groups, GROUP)
+    g = flat.view(out, n_groups, INT4_GROUP)
+    max_per_g = g.abs().amax(dim=-1, keepdim=True)
+    scale = (max_per_g / 7.0).clamp(min=1e-8)
+    q = (g / scale).round().clamp(-7, 7).to(torch.int8)   # (out, n_groups, GROUP)
+    # Pack two int4 → one uint8 along the group axis (GROUP must be even).
+    q_pack = q.view(out, n_groups, INT4_GROUP // 2, 2)
+    lo = (q_pack[..., 0].to(torch.int16) & 0x0F).to(torch.uint8)
+    hi = (q_pack[..., 1].to(torch.int16) & 0x0F).to(torch.uint8)
+    packed = (lo | (hi << 4)).contiguous().view(out, padded // 2)
+    meta = torch.tensor([len(orig_shape)] + orig_shape + [int(pad), n_groups, INT4_GROUP],
+                        dtype=torch.int32)
+    # scale shape: (out, n_groups)
+    return (packed, meta), scale.squeeze(-1).to(torch.float16).contiguous()
+
+
+def _int4_dequantize(packed_meta: tuple, scale: torch.Tensor, dtype: torch.dtype,
+                     device: torch.device) -> torch.Tensor:
+    """Reconstruct an fp16 weight from per-group int4 master on the GPU."""
+    if scale is None:
+        packed = packed_meta if not isinstance(packed_meta, tuple) else packed_meta[0]
+        return packed.to(device=device, dtype=dtype, non_blocking=True)
+    packed, meta = packed_meta
+    ndim = int(meta[0])
+    orig_shape = [int(x) for x in meta[1:1 + ndim]]
+    pad = int(meta[-3]); n_groups = int(meta[-2]); group = int(meta[-1])
+    out = orig_shape[0]
+    p_dev = packed.to(device=device, non_blocking=True)     # (out, padded/2) uint8
+    lo = (p_dev & 0x0F).to(torch.int8)
+    hi = ((p_dev >> 4) & 0x0F).to(torch.int8)
+    lo = torch.where(lo >= 8, lo - 16, lo)
+    hi = torch.where(hi >= 8, hi - 16, hi)
+    # interleave into (out, n_groups, group)
+    inter = torch.empty(out, n_groups * group, dtype=torch.int8, device=device)
+    inter[:, 0::2] = lo
+    inter[:, 1::2] = hi
+    g = inter.view(out, n_groups, group).to(dtype)
+    s_dev = scale.to(device=device, dtype=dtype, non_blocking=True).view(out, n_groups, 1)
+    deq = (g * s_dev).view(out, n_groups * group)
+    if pad: deq = deq[:, : n_groups * group - pad]
+    return deq.view(*orig_shape)
+
+
 class PagedTransformerLayer(nn.Module):
     """Wraps a transformer block; pages its weights CPU↔GPU under a BodyPager budget.
 
@@ -158,39 +229,43 @@ class PagedTransformerLayer(nn.Module):
     so their PCIe transfer hides under our compute (the brief's spiral δ
     applied at the layer axis instead of the token axis).
 
-    `int8_master`: if True, store every big weight in int8 with a per-row
-    fp16 scale on the CPU. PCIe transfer drops 4× — the only practical way
-    to break the 14 GiB-body bottleneck on a 4 GiB GPU at speeds that look
-    like chat. Norms / biases stay in fp16 so the residual stream is exact.
+    `quant`: "fp16" (byte-exact), "int8" (4× less PCIe), or "int4" (8× less
+    — the lever that lets a 7B body fit entirely on a 4 GiB GPU at ~10 tok/s
+    instead of being PCIe-throttled). Norms / biases stay fp16 in all modes
+    so the residual stream is exact.
     """
     def __init__(self, layer: nn.Module, *, compute_device: torch.device,
                  pager: BodyPager, prefetch_stream: Optional[torch.cuda.Stream] = None,
-                 int8_master: bool = False):
+                 quant: str = "fp16", int8_master: bool = False):
         super().__init__()
         self.layer = layer
         self.compute_device = compute_device
         self.pager = pager
         self.prefetch_stream = prefetch_stream
-        self.int8_master = bool(int8_master)
+        # back-compat: int8_master=True (legacy) → quant="int8"
+        if int8_master and quant == "fp16": quant = "int8"
+        if quant not in ("fp16", "int8", "int4"):
+            raise ValueError(f"quant must be fp16/int8/int4, got {quant!r}")
+        self.quant = quant
         # the linked list of layer-index → next layer; set up by paged_body()
         self.index: int = -1
         self.siblings: list["PagedTransformerLayer"] = []   # all wrapped layers, in order
-        # CPU master copies. For int8_master, value is (int8_tensor, fp16_scales)
-        # — for fp16, value is just the cpu fp16 tensor with scales=None.
-        self._cpu_master: dict[str, tuple[torch.Tensor, Optional[torch.Tensor]]] = {}
+        # CPU master copies. value = (master_tensor_or_packed, fp16_scales_or_None).
+        # For fp16: (cpu_tensor, None). int8: (int8_tensor, scale). int4:
+        # ((packed_uint8, meta_int32), scale).
+        self._cpu_master: dict[str, tuple] = {}
         self._fp_dtype: torch.dtype = torch.float16
         for name, p in layer.named_parameters(recurse=True):
             cpu = p.data.detach().to("cpu").contiguous()
             self._fp_dtype = cpu.dtype
-            # inference-only — drop grads so we can swap .data freely between
-            # fp16 (on GPU during forward) and int8 master (on CPU between).
-            # Without this, assigning int8 .data fails the "must be floating
-            # point" check on a grad-tracked parameter.
             p.requires_grad_(False)
-            if self.int8_master:
+            if self.quant == "int8":
                 q, scale = _int8_quantize(cpu)
                 self._cpu_master[name] = (q, scale)
-                # fp16 placeholder so .data is always floating until admit
+                p.data = torch.empty(0, dtype=cpu.dtype)
+            elif self.quant == "int4":
+                packed, scale = _int4_quantize(cpu)
+                self._cpu_master[name] = (packed, scale)
                 p.data = torch.empty(0, dtype=cpu.dtype)
             else:
                 self._cpu_master[name] = (cpu, None)
@@ -202,38 +277,41 @@ class PagedTransformerLayer(nn.Module):
         self._on_gpu: bool = False
         self._param_map = {name: param for name, param in layer.named_parameters(recurse=True)}
 
+    def _admit_one(self, name: str, cpu_t, scale):
+        """Move one parameter's CPU master onto the compute device, dequantizing
+        if needed. Used by _to_gpu_internal both with and without a side stream."""
+        if scale is None:
+            # fp16 path — straight copy
+            self._param_map[name].data = cpu_t.to(self.compute_device,
+                dtype=self._fp_dtype, non_blocking=True)
+        elif self.quant == "int4":
+            self._param_map[name].data = _int4_dequantize(cpu_t, scale,
+                self._fp_dtype, self.compute_device)
+        else:   # int8
+            self._param_map[name].data = _int8_dequantize(cpu_t, scale,
+                self._fp_dtype, self.compute_device)
+
     # internal — called only from BodyPager
     def _to_gpu_internal(self, stream: Optional[torch.cuda.Stream] = None):
         if self._on_gpu: return
         if stream is not None:
             with torch.cuda.stream(stream):
                 for name, (cpu_t, scale) in self._cpu_master.items():
-                    if scale is not None:
-                        self._param_map[name].data = _int8_dequantize(cpu_t, scale,
-                            self._fp_dtype, self.compute_device)
-                    else:
-                        self._param_map[name].data = cpu_t.to(self.compute_device,
-                            dtype=self._fp_dtype, non_blocking=True)
+                    self._admit_one(name, cpu_t, scale)
         else:
             for name, (cpu_t, scale) in self._cpu_master.items():
-                if scale is not None:
-                    self._param_map[name].data = _int8_dequantize(cpu_t, scale,
-                        self._fp_dtype, self.compute_device)
-                else:
-                    self._param_map[name].data = cpu_t.to(self.compute_device,
-                        dtype=self._fp_dtype, non_blocking=True)
+                self._admit_one(name, cpu_t, scale)
         self._on_gpu = True
 
     def _to_cpu_internal(self):
         if not self._on_gpu: return
         for name, (cpu_t, scale) in self._cpu_master.items():
             if scale is None:
-                # fp16 master — point .data back at the CPU master, freeing GPU storage
                 self._param_map[name].data = cpu_t
             else:
-                # int8 master — .data must stay floating-point (param invariant),
-                # so we put an empty fp16 placeholder and rely on _cpu_master to
-                # hold the real int8 bytes. Admit dequantizes them onto the GPU.
+                # int8/int4 master — .data must stay floating-point (param
+                # invariant); the real bytes live in _cpu_master. Admit
+                # dequantizes them onto the GPU when needed.
                 self._param_map[name].data = torch.empty(0, dtype=self._fp_dtype)
         self._on_gpu = False
 
@@ -332,26 +410,27 @@ def _decide_working_set(layers, compute_device: torch.device,
 def paged_body(model: nn.Module, *, compute_device: torch.device | str,
                prefetch: bool = True, working_set: Optional[int] = None,
                prefetch_fanout: int = 8, reserve_mb: int = 700,
+               quant: str = "fp16",
                int8_master: bool = False) -> tuple[int, int]:
     """Wrap every transformer layer in the body for CPU↔GPU paging with a
     working-set budget.
 
-    Returns (num_layers_wrapped, working_set_chosen).  The first paged layer's
-    weights are loaded eagerly so the first forward isn't a cold start.
+    `quant`: "fp16" (byte-exact), "int8" (~4× less PCIe), "int4" (~8× less
+    + the whole 7B body fits on a 4 GiB GPU at full speed).
 
-    `int8_master=True` stores big weights as int8 + per-row scales on the
-    CPU. PCIe transfer drops 4×; on the 4 GiB / 7B path this is the lever
-    that turns 0.05 tok/s into something that looks like chat. Tiny tensors
-    (norms / biases / scalars) stay fp16 so the residual stream is exact.
+    Returns (num_layers_wrapped, working_set_chosen). The first paged layer's
+    weights are loaded eagerly so the first forward isn't a cold start.
     """
+    if int8_master and quant == "fp16": quant = "int8"   # back-compat
+    if quant not in ("fp16", "int8", "int4"):
+        raise ValueError(f"quant must be fp16/int8/int4, got {quant!r}")
     compute_device = torch.device(compute_device)
     layers = _iter_body_layers(model)
-    # int8 cuts the per-layer footprint ~4×, so the working-set decision
-    # should be made against the *quantized* size when int8_master is on.
-    eff_layer_bytes = (
-        sum(_layer_cpu_bytes(l) for l in layers) // 4
-        if int8_master else sum(_layer_cpu_bytes(l) for l in layers)
-    )
+    # Quantization cuts the per-layer footprint, so the working-set decision
+    # should be made against the *quantized* size.
+    divisor = {"fp16": 1, "int8": 4, "int4": 8}[quant]
+    total_bytes = sum(_layer_cpu_bytes(l) for l in layers)
+    eff_layer_bytes = total_bytes // divisor
     avg_layer_bytes = eff_layer_bytes / max(len(layers), 1)
     ws = _decide_working_set_from_avg(layers, compute_device, working_set,
                                       avg_layer=avg_layer_bytes, reserve_mb=reserve_mb)
@@ -362,7 +441,7 @@ def paged_body(model: nn.Module, *, compute_device: torch.device | str,
     for layer in layers:
         pl = PagedTransformerLayer(layer, compute_device=compute_device,
                                    pager=pager, prefetch_stream=stream,
-                                   int8_master=int8_master)
+                                   quant=quant)
         wrapped.append(pl)
     # set indices + sibling linkage for helical prefetch
     for i, pl in enumerate(wrapped):

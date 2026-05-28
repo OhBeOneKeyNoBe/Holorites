@@ -56,6 +56,52 @@ _last_chat_stats: dict | None = None
 
 def fmt_mb(b): return f"{b/1_048_576:.1f} MiB"
 
+def _load_streamed(man: dict, manifest_path: str):
+    """`runtime: "streamer"` path — body weights live on disk as a chunked
+    asset tree. Loads only the architecture + the embedding torus; each
+    transformer layer is streamed per-forward via HoloriteStreamer.
+
+    Required manifest fields:
+      runtime: "streamer"
+      asset_root: absolute path to the dir containing tree.json
+      model_id: HF id for the skeleton (we use the architecture only)
+      embeddings_torus: path to the torus sidecar (built by holoritify.py)
+    """
+    from streaming_engine import HoloriteStreamer, stream_body
+    print(f"[holorite] streaming runtime — asset tree {man['asset_root']}", flush=True)
+    tok = AutoTokenizer.from_pretrained(man["model_id"])
+    skel = AutoModelForCausalLM.from_pretrained(
+        man["model_id"], torch_dtype=DTYPE, low_cpu_mem_usage=True,
+    ).eval()
+    # The skeleton's BODY weights will be supplied by the streamer; we still
+    # let the model load them once on CPU so the shape/structure is preserved.
+    streamer = HoloriteStreamer(man["asset_root"], compute_device=DEVICE,
+                                working_set=int(man.get("working_set") or 8),
+                                prefetch_fanout=int(man.get("prefetch_fanout") or 8),
+                                fp_dtype=DTYPE).open()
+    n_streamed = stream_body(skel, streamer)
+    print(f"[holorite] streamed {n_streamed} body layers from disk "
+          f"(ws={streamer.working_set}, fanout={streamer.prefetch_fanout})", flush=True)
+    # Paged embedding (same path as fp16 Holorites)
+    emb_orig = skel.get_input_embeddings()
+    full_W = emb_orig.weight.detach().to("cpu").clone()
+    paged = NodePagedEmbedding(full_W, pad_token_id=man.get("pad_token_id"),
+                               cpu_device="cpu", compute_device=DEVICE,
+                               max_cached_nodes=NODES_TOTAL,
+                               helical_prefetch=True, prefetch_fanout=8)
+    skel.set_input_embeddings(paged)
+    # tiny tensors stay on GPU
+    for name, p in skel.named_parameters():
+        if "model.norm" in name or "lm_head" in name or "model.embed_norm" in name:
+            p.data = p.data.to(DEVICE)
+    for name, b in skel.named_buffers():
+        if "embed_tokens" in name: continue
+        try: b.data = b.data.to(DEVICE)
+        except Exception: pass
+    full_emb_bytes = full_W.numel() * full_W.element_size()
+    return tok, skel, paged, full_emb_bytes
+
+
 def load_holorite(manifest_path: str):
     global _current_path
     with _loaded_lock:
@@ -88,6 +134,12 @@ def load_holorite(manifest_path: str):
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
         with open(manifest_path, encoding="utf-8") as f: man = json.load(f)
+        # Branch on runtime — "streamer" loads via the asset tree, everything
+        # else uses the in-RAM CPU-master body_pager path.
+        if man.get("runtime") == "streamer":
+            _loaded[manifest_path] = _load_streamed(man, manifest_path)
+            _current_path = manifest_path
+            return _loaded[manifest_path]
         print(f"[holorite] loading {man['name']}  vocab={man['vocab_size']} hidden={man['hidden_dim']}", flush=True)
         tok = AutoTokenizer.from_pretrained(man["model_id"])
 
@@ -121,16 +173,29 @@ def load_holorite(manifest_path: str):
         # supposedly moved off). The clean snapshot is the truth.
         free_now = _CLEAN_FREE if DEVICE == "cuda" else (1 << 40)
         body_budget = max(0, free_now - 250 * 1_048_576)   # 250 MiB reserve — user's other apps already eat most of the 4 GiB
-        # Explicit user override always wins
-        int8_master = bool(int(os.environ.get("HOLORITE_INT8_BODY", "0")))
-        if man.get("int8_body") is True: int8_master = True
-        elif man.get("int8_body") is False: int8_master = False
+        # Explicit overrides (env or manifest) — env wins, manifest second.
+        # Manifest keys: quant: "fp16"/"int8"/"int4", or legacy int8_body bool.
+        env_quant = os.environ.get("HOLORITE_QUANT", "").lower()
+        if env_quant in ("fp16", "int8", "int4"):
+            quant = env_quant
+        elif man.get("quant") in ("fp16", "int8", "int4"):
+            quant = man["quant"]
+        elif man.get("int8_body") is True: quant = "int8"
+        elif man.get("int8_body") is False: quant = "fp16"
         else:
-            # auto: engage int8 only when fp16 whole-body would substantially
-            # overflow the budget (margin 1.6× absorbs PyTorch's caching-
-            # allocator stickiness AND the model-load transient that briefly
-            # touched GPU before low_cpu_mem_usage moved things to CPU).
-            int8_master = (n_layers * avg_layer_fp16) > (body_budget * 1.6)
+            # auto: pick the lightest quant that lets the whole body live in
+            # `body_budget`. Aim for "fits with no paging churn" — that's how
+            # we get back to GPU-compute-speed instead of being PCIe-bound.
+            body_fp16 = n_layers * avg_layer_fp16
+            if body_fp16 <= body_budget:
+                quant = "fp16"
+            elif body_fp16 / 4 <= body_budget:
+                quant = "int8"
+            else:
+                # the 7B-on-4GiB lever: int4 cuts body 8× → 14 GiB → 1.75 GiB
+                # → fits even with the user's other apps holding most of VRAM.
+                quant = "int4"
+        int8_master = (quant == "int8")   # legacy alias used elsewhere
         # working_set=None → auto-size in paged_body, with round-up to whole body
         # when ≥85% would fit (so small models hold everything, no churn).
         # reserve_mb=250 mirrors the budget calc above — user's GPU is shared
@@ -138,17 +203,18 @@ def load_holorite(manifest_path: str):
         print(f"[holorite-debug] free_now={free_now/1_048_576:.0f} MiB · "
               f"body_fp16_total={n_layers*avg_layer_fp16/1_048_576:.0f} MiB · "
               f"body_budget={body_budget/1_048_576:.0f} MiB · "
-              f"int8_master={int8_master}", flush=True)
+              f"quant={quant}", flush=True)
         n_wrapped, ws = paged_body(model, compute_device=DEVICE, prefetch=True,
                                    working_set=None, prefetch_fanout=8, reserve_mb=250,
-                                   int8_master=int8_master)
+                                   quant=quant)
         if ws >= n_wrapped:
             mode = f"all {n_wrapped} layers fit (no eviction)"
         else:
             mode = f"working set {ws}/{n_wrapped} layers (LRU streams the rest)"
-        if int8_master: mode += "  · int8 body master (4× less PCIe)"
-        else: mode += "  · fp16 body master (byte-exact)"
-        print(f"[holorite] body-paged: {mode}", flush=True)
+        q_desc = {"fp16": "fp16 body master (byte-exact)",
+                  "int8": "int8 body master (4× less PCIe, ~byte-exact)",
+                  "int4": "int4 body master (8× less PCIe — the 4 GiB / 7B lever)"}[quant]
+        print(f"[holorite] body-paged: {mode}  ·  {q_desc}", flush=True)
 
         # Step 3 — paged embedding on the input side.
         emb_orig = model.get_input_embeddings()
