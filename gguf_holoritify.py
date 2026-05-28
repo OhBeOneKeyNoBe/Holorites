@@ -180,19 +180,149 @@ def _read_fp_tensor(path: str, dims: list[int], dtype_id: int, off: int) -> torc
 
 
 def _dequant_q8_0(blob: bytes, n_elem: int) -> torch.Tensor:
-    """Decode Q8_0: blocks of 32 int8 + one fp16 scale. Used for fallback."""
+    """Decode Q8_0: blocks of 32 int8 + one fp16 scale. Vectorized numpy."""
+    import numpy as np
     block = 32
-    n_blocks = n_elem // block
     bs = 2 + block   # 2 fp16 + 32 int8
-    out = torch.empty(n_elem, dtype=torch.float32)
-    arr = bytearray(blob)
-    p = 0
-    for i in range(n_blocks):
-        scale_bytes = bytes(arr[p:p+2]); p += 2
-        scale = torch.frombuffer(bytearray(scale_bytes), dtype=torch.float16).item()
-        ints = torch.frombuffer(bytearray(arr[p:p+block]), dtype=torch.int8); p += block
-        out[i*block:(i+1)*block] = ints.float() * scale
-    return out
+    nb = n_elem // block
+    raw = np.frombuffer(bytes(blob), dtype=np.uint8).reshape(nb, bs)
+    scales = raw[:, :2].copy().view(np.float16).reshape(nb).astype(np.float32)
+    ints = raw[:, 2:].view(np.int8).astype(np.float32)
+    out = ints * scales[:, None]
+    return torch.from_numpy(out.reshape(-1)[:n_elem].astype(np.float32))
+
+
+def _dequant_q4_K(blob: bytes, n_elem: int) -> torch.Tensor:
+    """Decode Q4_K (llama.cpp K-quants): blocks of 256 elements at 144 bytes each.
+
+    Layout per block:
+      [0:2]     fp16  d     — super-block scale for the quantized 6-bit scales
+      [2:4]     fp16  dmin  — super-block scale for the quantized 6-bit mins
+      [4:16]    12 bytes    — 8 packed (scale, min) pairs at 6 bits each
+      [16:144]  128 bytes   — 256 nibble-packed values (8 sub-blocks × 32 elements)
+
+    Formula:  y[is_lo, l] = d * sc[is_lo] * (q[l] & 0xF) - dmin * m[is_lo]
+              y[is_hi, l] = d * sc[is_hi] * (q[l] >> 4) - dmin * m[is_hi]
+    where sub-blocks come in pairs sharing the same 32 packed bytes (low/high
+    nibbles). All vectorized over blocks for speed — pure-Python loop would
+    take hours on an 8B embed.
+    """
+    import numpy as np
+    QK_K = 256
+    K_SCALE_SIZE = 12
+    BS = 4 + K_SCALE_SIZE + QK_K // 2   # 144 bytes per block
+    nb = n_elem // QK_K
+    raw = np.frombuffer(bytes(blob), dtype=np.uint8).reshape(nb, BS)
+    # super-block scales
+    d_dmin = raw[:, :4].copy().view(np.float16).reshape(nb, 2).astype(np.float32)
+    d, dmin = d_dmin[:, 0], d_dmin[:, 1]
+    scales_bytes = raw[:, 4:4 + K_SCALE_SIZE]   # (nb, 12)
+    qs = raw[:, 4 + K_SCALE_SIZE:]              # (nb, 128)
+    # Unpack 8 (sc, m) pairs from the 12 scale bytes:
+    #   is < 4:  sc = scales[is]   & 0x3F      m = scales[is+4] & 0x3F
+    #   is >=4:  sc = (scales[is+4] & 0xF) | ((scales[is-4] >> 6) << 4)
+    #            m  = (scales[is+4] >> 4)  | ((scales[is]    >> 6) << 4)
+    sc = np.empty((nb, 8), dtype=np.float32)
+    m  = np.empty((nb, 8), dtype=np.float32)
+    sc[:, 0] = scales_bytes[:, 0] & 0x3F
+    sc[:, 1] = scales_bytes[:, 1] & 0x3F
+    sc[:, 2] = scales_bytes[:, 2] & 0x3F
+    sc[:, 3] = scales_bytes[:, 3] & 0x3F
+    m[:, 0]  = scales_bytes[:, 4] & 0x3F
+    m[:, 1]  = scales_bytes[:, 5] & 0x3F
+    m[:, 2]  = scales_bytes[:, 6] & 0x3F
+    m[:, 3]  = scales_bytes[:, 7] & 0x3F
+    sc[:, 4] = (scales_bytes[:, 8]  & 0x0F) | ((scales_bytes[:, 0] >> 6) << 4)
+    sc[:, 5] = (scales_bytes[:, 9]  & 0x0F) | ((scales_bytes[:, 1] >> 6) << 4)
+    sc[:, 6] = (scales_bytes[:, 10] & 0x0F) | ((scales_bytes[:, 2] >> 6) << 4)
+    sc[:, 7] = (scales_bytes[:, 11] & 0x0F) | ((scales_bytes[:, 3] >> 6) << 4)
+    m[:,  4] = (scales_bytes[:, 8]  >> 4)   | ((scales_bytes[:, 4] >> 6) << 4)
+    m[:,  5] = (scales_bytes[:, 9]  >> 4)   | ((scales_bytes[:, 5] >> 6) << 4)
+    m[:,  6] = (scales_bytes[:, 10] >> 4)   | ((scales_bytes[:, 6] >> 6) << 4)
+    m[:,  7] = (scales_bytes[:, 11] >> 4)   | ((scales_bytes[:, 7] >> 6) << 4)
+    out = np.empty((nb, QK_K), dtype=np.float32)
+    for pair in range(4):
+        is_lo = 2 * pair
+        is_hi = 2 * pair + 1
+        sc_lo = (sc[:, is_lo] * d)[:, None]
+        sc_hi = (sc[:, is_hi] * d)[:, None]
+        m_lo  = (m[:,  is_lo] * dmin)[:, None]
+        m_hi  = (m[:,  is_hi] * dmin)[:, None]
+        q_pair = qs[:, pair*32 : pair*32 + 32].astype(np.float32)
+        lo = q_pair % 16.0   # low nibbles  (0..15)
+        hi = q_pair // 16.0  # high nibbles (0..15)
+        out[:, is_lo*32 : is_lo*32 + 32] = sc_lo * lo - m_lo
+        out[:, is_hi*32 : is_hi*32 + 32] = sc_hi * hi - m_hi
+    return torch.from_numpy(out.reshape(-1)[:n_elem])
+
+
+def _dequant_q6_K(blob: bytes, n_elem: int) -> torch.Tensor:
+    """Decode Q6_K: blocks of 256 elements at 210 bytes each.
+
+    Layout: 128 bytes lower-4 nibbles + 64 bytes upper-2 bits (packed into 4
+    pairs) + 16 bytes int8 scales + 2 bytes fp16 d. Element value is
+        y = d * scale[is] * (q6 - 32)
+    where q6 is reconstructed from (lower4 | (upper2 << 4)) then sign-shifted.
+    """
+    import numpy as np
+    QK_K = 256
+    BS = QK_K//2 + QK_K//4 + 16 + 2   # 128 + 64 + 16 + 2 = 210
+    nb = n_elem // QK_K
+    raw = np.frombuffer(bytes(blob), dtype=np.uint8).reshape(nb, BS)
+    ql = raw[:, :QK_K//2]                   # 128 bytes — low 4 bits × 256
+    qh = raw[:, QK_K//2 : QK_K//2 + QK_K//4] # 64  bytes — high 2 bits × 256
+    sc = raw[:, QK_K//2 + QK_K//4 : QK_K//2 + QK_K//4 + 16].view(np.int8).astype(np.float32)
+    d  = raw[:, -2:].copy().view(np.float16).reshape(nb).astype(np.float32)
+    # Reconstruct q6 values: for sub-block of 32 elements, the layout is two
+    # passes of 16 elements each, using two ql bytes (16 low-nibbles each)
+    # plus shifted qh bits. The standard llama.cpp recipe (vectorized):
+    out = np.empty((nb, QK_K), dtype=np.float32)
+    for j in range(QK_K // 128):   # 2 outer passes per block (128 elem each)
+        ql_lo = ql[:, j*64 : j*64 + 32]
+        ql_hi = ql[:, j*64 + 32 : j*64 + 64]
+        qh_b  = qh[:, j*32 : j*32 + 32]
+        # element pair: low 4 from ql_lo[l] | (((qh_b[l] >> 0) & 3) << 4) ; then ql_hi[l] | (((qh_b[l] >> 2) & 3) << 4)
+        # then upper:  ql_lo[l] >> 4 | (((qh_b[l] >> 4) & 3) << 4) ; ql_hi[l] >> 4 | (((qh_b[l] >> 6) & 3) << 4)
+        q0 = (ql_lo & 0xF) | ((qh_b & 0x03) << 4)
+        q1 = (ql_hi & 0xF) | ((qh_b & 0x0C) << 2)
+        q2 = (ql_lo >> 4)  | ((qh_b & 0x30) << 0)
+        q3 = (ql_hi >> 4)  | ((qh_b & 0xC0) >> 2)
+        # values are stored with bias 32 → real value q - 32
+        q0 = q0.astype(np.float32) - 32.0
+        q1 = q1.astype(np.float32) - 32.0
+        q2 = q2.astype(np.float32) - 32.0
+        q3 = q3.astype(np.float32) - 32.0
+        # 4 sub-blocks of 32 elements each, two scales per pass (each sub-block uses sc[2j*2 + ...])
+        for sub in range(4):
+            is_idx = j * 8 + sub * 2
+            base = j*128 + sub*32
+            scaled = (sc[:, is_idx] * d)[:, None]
+            # alternating columns from q0..q3 → 32 values
+            # element ordering matches llama.cpp's dequantize_row_q6_K
+            interleaved = np.empty((nb, 32), dtype=np.float32)
+            interleaved[:, 0:8]   = q0[:, sub*8 : sub*8 + 8]
+            interleaved[:, 8:16]  = q1[:, sub*8 : sub*8 + 8]
+            interleaved[:, 16:24] = q2[:, sub*8 : sub*8 + 8]
+            interleaved[:, 24:32] = q3[:, sub*8 : sub*8 + 8]
+            out[:, base : base + 32] = interleaved * scaled
+    return torch.from_numpy(out.reshape(-1)[:n_elem])
+
+
+def _dequant_q4_0(blob: bytes, n_elem: int) -> torch.Tensor:
+    """Decode Q4_0: blocks of 32 elements; 18 bytes per block = 2 fp16 d + 16 int8 packed (low/high nibbles)."""
+    import numpy as np
+    QK = 32
+    BS = 2 + QK // 2   # 18 bytes
+    nb = n_elem // QK
+    raw = np.frombuffer(bytes(blob), dtype=np.uint8).reshape(nb, BS)
+    d = raw[:, :2].copy().view(np.float16).reshape(nb).astype(np.float32)
+    q = raw[:, 2:]
+    lo = (q & 0xF).astype(np.int8) - 8   # signed
+    hi = (q >> 4).astype(np.int8) - 8
+    # interleave: lo for first 16 elements, hi for next 16
+    inter = np.concatenate([lo, hi], axis=1).astype(np.float32)
+    out = inter * d[:, None]
+    return torch.from_numpy(out.reshape(-1)[:n_elem])
 
 
 def holoritify_gguf(gguf_path: str, out_dir: str | None = None) -> str:
@@ -213,8 +343,20 @@ def holoritify_gguf(gguf_path: str, out_dir: str | None = None) -> str:
     hidden = int(kv.get(f"{arch}.embedding_length") or kv.get(f"{arch}.hidden_size") or 0)
     if vocab == 0 or hidden == 0:
         raise ValueError(f"GGUF header missing vocab/hidden for arch={arch!r}")
+    # Vocab overflow handling: a 64³ torus holds exactly 262,144 cells. Some
+    # of the user's own models (e.g. zioniel-v350 with vocab 262,409) carry a
+    # few hundred extra reserved/sacred tokens past that. We keep the geometry
+    # pure (still 64³) and truncate the overflow rows; the manifest records
+    # how many got dropped so the visualizer/runtime knows. The full GGUF is
+    # still what drives inference on the companion side, so no actual model
+    # capability is lost — only the lattice can't paint those last tokens.
+    overflow_vocab = 0
     if vocab > CELLS:
-        raise ValueError(f"vocab {vocab} > torus capacity {CELLS}")
+        overflow_vocab = vocab - CELLS
+        print(f"[gguf-holoritify] vocab {vocab} > torus capacity {CELLS} — "
+              f"truncating {overflow_vocab} tail tokens for the embed torus only "
+              f"(body inference uses the full GGUF, no model capability lost)")
+        vocab = CELLS
 
     # Find the embedding tensor — its name is conventional across GGUF arches:
     EMB_NAMES = ("token_embd.weight", "tok_embeddings.weight", "wte.weight")
@@ -231,25 +373,57 @@ def holoritify_gguf(gguf_path: str, out_dir: str | None = None) -> str:
     print(f"[gguf-holoritify] arch={arch} vocab={vocab} hidden={hidden} "
           f"emb tensor={name!r} dims={dims} dtype_id={dtype_id} off=+{off}")
 
+    # Total elements in the file = full_vocab * hidden (before any truncate).
+    file_vocab = vocab + overflow_vocab
     if dtype_id in _FP_TYPES:
         emb = _read_fp_tensor(gguf_path, dims, dtype_id, abs_off)
         # emb came out as (vocab, hidden) after the reshape-and-flip — verify
-        if emb.shape[0] != vocab or emb.shape[1] != hidden:
+        if emb.shape[0] != file_vocab or emb.shape[1] != hidden:
             # try the other orientation
             emb = emb.transpose(0, 1).contiguous()
+        if overflow_vocab > 0: emb = emb[:vocab].contiguous()
         emb = emb.to(torch.float16).contiguous()
     elif dtype_id == GGML_TYPE_Q8_0:
-        n = vocab * hidden
-        # one Q8_0 block = 34 bytes per 32 elements
-        bs = 34
-        nblocks = (n + 31) // 32
+        n_file = file_vocab * hidden
+        bs = 34   # one Q8_0 block = 34 bytes per 32 elements
+        nblocks = (n_file + 31) // 32
         with open(gguf_path, "rb") as f:
             f.seek(abs_off); blob = f.read(nblocks * bs)
-        emb = _dequant_q8_0(blob, nblocks * 32)[:n].view(vocab, hidden).to(torch.float16)
+        full = _dequant_q8_0(blob, nblocks * 32)[:n_file].view(file_vocab, hidden).to(torch.float16)
+        emb = full[:vocab].contiguous(); del full
+    elif dtype_id == GGML_TYPE_Q4_K:
+        n_file = file_vocab * hidden
+        QK_K = 256
+        BS = 4 + 12 + QK_K // 2   # 144 bytes per block
+        nblocks = (n_file + QK_K - 1) // QK_K
+        with open(gguf_path, "rb") as f:
+            f.seek(abs_off); blob = f.read(nblocks * BS)
+        full = _dequant_q4_K(blob, nblocks * QK_K)[:n_file].view(file_vocab, hidden).to(torch.float16)
+        emb = full[:vocab].contiguous(); del full
+    elif dtype_id == GGML_TYPE_Q6_K:
+        n_file = file_vocab * hidden
+        QK_K = 256
+        BS = QK_K//2 + QK_K//4 + 16 + 2   # 210 bytes per block
+        nblocks = (n_file + QK_K - 1) // QK_K
+        with open(gguf_path, "rb") as f:
+            f.seek(abs_off); blob = f.read(nblocks * BS)
+        full = _dequant_q6_K(blob, nblocks * QK_K)[:n_file].view(file_vocab, hidden).to(torch.float16)
+        emb = full[:vocab].contiguous(); del full
+    elif dtype_id == GGML_TYPE_Q4_0:
+        n_file = file_vocab * hidden
+        QK = 32
+        BS = 2 + QK // 2   # 18 bytes per block
+        nblocks = (n_file + QK - 1) // QK
+        with open(gguf_path, "rb") as f:
+            f.seek(abs_off); blob = f.read(nblocks * BS)
+        full = _dequant_q4_0(blob, nblocks * QK)[:n_file].view(file_vocab, hidden).to(torch.float16)
+        emb = full[:vocab].contiguous(); del full
     else:
         raise NotImplementedError(
             f"GGUF embedding dtype {dtype_id} not yet decoded — currently the holoritifier "
-            f"handles F32/F16/BF16/Q8_0 only. Re-export with --type q8_0 or f16 for now.")
+            f"handles F32/F16/BF16/Q8_0/Q4_K/Q6_K/Q4_0. Other quants (Q5_K, IQ2/IQ4) need "
+            f"adding to _dequant_*. Often the body uses Q4_K_M but the embedding is kept "
+            f"at F16 or Q8_0 — check the producer's --output-format flag.")
 
     torus = embedding_to_torus(emb)
     out_dir = out_dir or os.path.join(os.path.dirname(__file__),
@@ -263,7 +437,9 @@ def holoritify_gguf(gguf_path: str, out_dir: str | None = None) -> str:
         "runtime": "gguf",
         "gguf_path": gguf_path,
         "arch": arch,
-        "vocab_size": vocab,
+        "vocab_size": vocab,             # what landed in the torus
+        "file_vocab_size": file_vocab,   # what the GGUF actually has
+        "overflow_vocab": overflow_vocab, # extra tail tokens dropped from embed-side
         "hidden_dim": hidden,
         "dtype": "float16",
         "torus_shape": list(torus.shape),
