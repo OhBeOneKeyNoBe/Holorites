@@ -28,6 +28,8 @@ DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 _loaded_lock = threading.Lock()
 _loaded = {}
 _current_path: str | None = None
+# Most-recent /chat stats, exposed via /stats for the lattice live view.
+_last_chat_stats: dict | None = None
 
 def fmt_mb(b): return f"{b/1_048_576:.1f} MiB"
 
@@ -50,8 +52,18 @@ def load_holorite(manifest_path: str):
                         if pager is not None and hasattr(pager, "evict_all"):
                             pager.evict_all(); break
                 except Exception: pass
+                # explicitly drop the tuple's references so refcount hits 0
+                del prev_model
+            del prev
             import gc; gc.collect()
-            if DEVICE == "cuda": torch.cuda.empty_cache()
+            if DEVICE == "cuda":
+                # double empty_cache + ipc_collect to actually release reservations.
+                # Without this the auto-int8 trigger fires on the *next* load
+                # because it reads a stale low free-memory number.
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
         with open(manifest_path, encoding="utf-8") as f: man = json.load(f)
         print(f"[holorite] loading {man['name']}  vocab={man['vocab_size']} hidden={man['hidden_dim']}", flush=True)
         tok = AutoTokenizer.from_pretrained(man["model_id"])
@@ -69,13 +81,42 @@ def load_holorite(manifest_path: str):
         # With the side-stream prefetch enabled, the next layer's copy is
         # queued while the current layer is computing, so PCIe traffic hides
         # under compute (the brief's spiral δ applied at the layer axis).
-        from body_pager import paged_body
+        from body_pager import paged_body, _iter_body_layers, _layer_cpu_bytes
+        # Spontaneous working set: let the system use what it needs.
+        #   - small models (whole body fits): keep all layers resident, no paging churn
+        #   - 7B-class (body > VRAM): auto-size the rolling window to what fits and
+        #     auto-engage int8 master so PCIe transfer drops 4×
+        # Prefetch fanout is still 8 (the HoloStream window on the body axis),
+        # because prefetching is *free* when next-needed is well predicted.
+        body_layers = _iter_body_layers(model)
+        avg_layer_fp16 = sum(_layer_cpu_bytes(l) for l in body_layers) / max(len(body_layers), 1)
+        n_layers = len(body_layers)
+        if DEVICE == "cuda":
+            free_now, _ = torch.cuda.mem_get_info()
+        else:
+            free_now = 1 << 40
+        body_budget = max(0, free_now - 900 * 1_048_576)   # 900 MiB reserve for lm_head/embed/activations/KV
+        # Explicit user override always wins
+        int8_master = bool(int(os.environ.get("HOLORITE_INT8_BODY", "0")))
+        if man.get("int8_body") is True: int8_master = True
+        elif man.get("int8_body") is False: int8_master = False
+        else:
+            # auto: engage int8 only when fp16 whole-body would substantially
+            # overflow the budget (margin 1.25× to absorb PyTorch's caching-
+            # allocator stickiness; without the margin, the 1.5B kept tripping
+            # int8 because the 0.5B's evicted reservations hadn't released yet).
+            int8_master = (n_layers * avg_layer_fp16) > (body_budget * 1.25)
+        # working_set=None → auto-size in paged_body, with round-up to whole body
+        # when ≥85% would fit (so small models hold everything, no churn).
         n_wrapped, ws = paged_body(model, compute_device=DEVICE, prefetch=True,
-                                   prefetch_fanout=8, reserve_mb=700)
+                                   working_set=None, prefetch_fanout=8, reserve_mb=900,
+                                   int8_master=int8_master)
         if ws >= n_wrapped:
             mode = f"all {n_wrapped} layers fit (no eviction)"
         else:
             mode = f"working set {ws}/{n_wrapped} layers (LRU streams the rest)"
+        if int8_master: mode += "  · int8 body master (4× less PCIe)"
+        else: mode += "  · fp16 body master (byte-exact)"
         print(f"[holorite] body-paged: {mode}", flush=True)
 
         # Step 3 — paged embedding on the input side.
@@ -124,6 +165,15 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/" or self.path == "/healthz":
             return self._send_json(200, {"ok": True, "device": DEVICE,
                                          "loaded": list(_loaded.keys())})
+        if self.path == "/stats":
+            # Live snapshot for the companion's 13-torus lattice view —
+            # which Holorite is active, last forward's page stats, and the
+            # active (ring, node) cell so the renderer can light it up.
+            payload = {"ok": True, "device": DEVICE,
+                       "loaded": list(_loaded.keys()),
+                       "active_holorite": _current_path or "",
+                       "last_stats": _last_chat_stats}
+            return self._send_json(200, payload)
         return self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
@@ -209,6 +259,8 @@ class Handler(BaseHTTPRequestHandler):
                           "embed_on_gpu_mb": round(on_gpu / 1_048_576, 1),
                           "embed_full_mb": round(full_emb_bytes / 1_048_576, 1),
                           "saved_mb": round((full_emb_bytes - on_gpu) / 1_048_576, 1)})
+        global _last_chat_stats
+        _last_chat_stats = stats
         return self._send_json(200, {"text": reply, "stats": stats})
 
 
