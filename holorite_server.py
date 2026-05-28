@@ -305,6 +305,20 @@ class Handler(BaseHTTPRequestHandler):
             req = json.loads(raw or b"{}")
         except Exception:
             return self._send_json(400, {"error": "bad json"})
+        # GGUF Holorites run inference via node-llama-cpp on the companion
+        # side; they just /announce themselves so the lattice HUD knows which
+        # model is active. No body inference happens here for those.
+        if self.path == "/announce":
+            global _current_path
+            manifest = req.get("manifest") or ""
+            if manifest and os.path.exists(manifest):
+                _current_path = manifest
+                # also stash a barebones last_stats so the visualizer HUD
+                # has something to render until a chat populates real numbers
+                global _last_chat_stats
+                if _last_chat_stats is None:
+                    _last_chat_stats = {"announced": True, "active_cells": []}
+            return self._send_json(200, {"ok": True, "active": _current_path})
         if self.path != "/chat":
             return self._send_json(404, {"error": "not found"})
         manifest = req.get("manifest") or ""
