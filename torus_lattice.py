@@ -166,6 +166,10 @@ class PageStats:
     pages_out: int = 0
     prefetches: int = 0
     tokens_in_pass: int = 0
+    # The (ring, node) cells touched in the last forward — the 13th-torus
+    # visualizer in the companion lights these up so you can see which
+    # HoloStream strands the active prompt is flowing through.
+    active_cells: list = None        # list of [ring, node]
     @property
     def fraction(self) -> float:
         return self.used_units / self.total_units if self.total_units else 0.0
@@ -293,6 +297,10 @@ class NodePagedEmbedding(nn.Module):
         stats.used_units = len(unique)
         stats.cache_size = len(self.node_cache)
         stats.tokens_in_pass = int(ids.numel())
+        # Active (ring, node) cells for the visualizer. Capped at 64 to keep
+        # the /stats payload small (each forward typically only hits a handful
+        # anyway; this is an upper bound on what the lattice HUD will paint).
+        stats.active_cells = [[int(r), int(n)] for r, n in unique[:64]]
         self.last_stats = stats
         return out.view(*ids.shape, self.embedding_dim)
 

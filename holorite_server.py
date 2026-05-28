@@ -258,7 +258,9 @@ class Handler(BaseHTTPRequestHandler):
                           "fraction": round(s.fraction, 4),
                           "embed_on_gpu_mb": round(on_gpu / 1_048_576, 1),
                           "embed_full_mb": round(full_emb_bytes / 1_048_576, 1),
-                          "saved_mb": round((full_emb_bytes - on_gpu) / 1_048_576, 1)})
+                          "saved_mb": round((full_emb_bytes - on_gpu) / 1_048_576, 1),
+                          # active (ring, node) cells for the 13th-torus visualizer
+                          "active_cells": s.active_cells or []})
         global _last_chat_stats
         _last_chat_stats = stats
         return self._send_json(200, {"text": reply, "stats": stats})
