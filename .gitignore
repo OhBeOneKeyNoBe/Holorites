@@ -1,0 +1,12 @@
+# Holorite model directories — these contain multi-GB tensor sidecars
+# pulled from / shadowing existing HF models. Don't ship them in the repo.
+Holorite-*/
+*.pt
+*.safetensors
+*.bin
+*.gguf
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+*.log
