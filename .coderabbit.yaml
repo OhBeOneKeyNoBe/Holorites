@@ -1,0 +1,79 @@
+# CodeRabbit configuration for the Holorites repo.
+# Reference: https://docs.coderabbit.ai/guides/configure-coderabbit
+#
+# To activate: install the CodeRabbit GitHub App at
+#   https://github.com/marketplace/coderabbitai
+# and grant it access to OhBeOneKeyNoBe/Holorites. This file will be
+# auto-discovered and merged with the org defaults.
+
+language: en
+early_access: false
+
+reviews:
+  # Run a thorough review on every PR.
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  auto_review:
+    enabled: true
+    drafts: false
+    # Trigger reviews on push to main too, not just PRs — useful here since
+    # the repo is single-author and the workflow is push-to-main.
+    base_branches:
+      - main
+
+  # File-class-specific instructions so the bot knows the architecture.
+  path_instructions:
+    - path: "moe_*.py"
+      instructions: |
+        These files implement the streamer-driven MoE inference pipeline.
+        moe_streamer.py: per-expert byte slicing, three-stream cache,
+        anticipatory prefetch. moe_kernels.py: GPU-side Q4_K/Q6_K/Q8_0/
+        Q3_K/Q2_K/MXFP4 dequant. moe_forward.py: Qwen3-MoE GQA+RoPE+KV
+        cache + grouped GEMM. moe_chat.py: tokenizer + sampler.
+        Be especially watchful for: shape mismatches on GGUF
+        reverse-axis-order tensors; CUDA stream synchronization gaps;
+        Q4_K block alignment in slicing; KV cache concatenation bugs.
+
+    - path: "torus_lattice.py"
+      instructions: |
+        The 64³-per-shell Matryoshka geometric substrate.
+        Verify: bit-slice round-trips (token <-> address) preserve
+        identity; modular arithmetic on every torus axis; SPIRAL_Q=1
+        coprimality with 64.
+
+    - path: "vertical_axis.py"
+      instructions: |
+        Trajectory rays + cos θ alignment + ZeGoDie 12⁷ embedding.
+        Watch for: cos_alignment returning exactly +1 for cardinal up
+        and -1 for cardinal down (cardinal is (0,0,0)/(32,32,32) at
+        each shell); ZeGoDie ↔ ray round-trip exactness on the
+        12-face-to-64-slot quantization boundary.
+
+    - path: "gguf_holoritify.py"
+      instructions: |
+        GGUF parser + embedding torus builder. Verify: dequant decoders
+        for F32/F16/BF16/Q8_0/Q4_K/Q6_K/Q4_0 produce byte-equal
+        results to llama.cpp's reference; vocab overflow into shell 1
+        is correctly recorded in the manifest.
+
+    - path: "**/*.sh"
+      instructions: |
+        Download orchestrators. Curl invocations must always include
+        --continue-at - for resume-safety and --retry for transient
+        HF rate-limit recovery.
+
+tone_instructions: |
+  Be direct and technically precise. This codebase is a streaming-engine
+  for trillion-parameter MoE LLMs on a 4 GiB GPU. Pointing out:
+  - Algorithm correctness gaps (especially shape/dtype/stride issues)
+  - CUDA memory-safety concerns
+  - Numerical stability concerns in dequant kernels
+  - Off-by-one bugs in bit-slice arithmetic
+  matters more than style. Skip nitpicks on naming or comment density.
+
+chat:
+  auto_reply: true
