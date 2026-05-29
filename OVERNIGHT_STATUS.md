@@ -91,3 +91,7 @@ If you want to chunkify a finished GGUF manually:
 ```bash
 PYTHONIOENCODING=utf-8 py -X utf8 /d/Holorites/gguf_holoritify.py /path/to/model.gguf
 ```
+
+## R1 update (post-launch)
+
+R1 URL was double-fixed: the correct path is `DeepSeek-R1-Q4_K_M/` (with the model-name prefix), not just `Q4_K_M/`. The standalone `/tmp/dl_r1.sh` has the corrected URL and is now running in parallel with V4-Pro and V3 in the orchestrator. Combined three downloads are competing for bandwidth so individual throughput may dip; the orchestrator's retry logic handles transient stalls.
