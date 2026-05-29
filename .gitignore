@@ -15,3 +15,7 @@ __pycache__/
 # These are tests/data, not source. Keep them off the repo.
 stream-*/
 *.npy
+
+# Chunkified asset trees (per-tensor .chunk + .meta.json files)
+chunktree-*/
+*.chunk
