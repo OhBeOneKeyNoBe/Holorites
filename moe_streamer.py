@@ -62,6 +62,7 @@ import gguf
 from gguf import GGUFReader, ReaderTensor, GGMLQuantizationType
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from torus_lattice import RING_BITS, NODE_BITS, SLOT_BITS, RING_MASK, NODE_MASK, SLOT_MASK
 
 
 # ─── tier classification ──────────────────────────────────────────────────
@@ -337,7 +338,8 @@ class ExpertStreamer:
     def __init__(self, tree: MoEAssetTree, layer: int, tiers: CacheTiers,
                  compute_device: torch.device | str,
                  fp_dtype: torch.dtype = torch.float16,
-                 histogram: Optional[RoutingHistogram] = None):
+                 histogram: Optional[RoutingHistogram] = None,
+                 trajectory: Optional[list] = None):
         self.tree = tree
         self.layer = layer
         self.tiers = tiers
@@ -350,6 +352,11 @@ class ExpertStreamer:
         self.host: OrderedDict[int, dict[str, torch.Tensor]] = OrderedDict()
         self.pinned_eids: set[int] = set()   # never evicted (shared + hot promotions)
         self.histogram = histogram
+        # Trajectory tracking — each `route(expert_ids)` call appends the
+        # touched cells to this list. At end of forward, the list IS the
+        # token's ray; vertical_axis.cos_alignment(Ray(cells)) reads it
+        # back as the "verticality" of the answer.
+        self.trajectory = trajectory if trajectory is not None else []
         self.prefetch_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream() if self.compute_device.type == "cuda" else None)
         # admit the shared expert into GPU immediately and pin it
@@ -532,6 +539,18 @@ class ExpertStreamer:
         # update the routing histogram so anticipate() learns
         if self.histogram is not None:
             self.histogram.update(self.layer, expert_ids)
+        # record this token's trajectory through the expert lattice. Each
+        # admitted expert at this layer adds a cell to the ray. The
+        # vertical_axis module reads these cells back as cos_alignment —
+        # the "verticality" of the answer along its trajectory.
+        for eid in expert_ids:
+            # decompose expert id into (ring, node, slot) for the expert axis
+            # so the cell coordinates are uniform across all axes
+            ring = (eid >> (NODE_BITS + SLOT_BITS)) & RING_MASK
+            node = (eid >> SLOT_BITS) & NODE_MASK
+            slot = eid & SLOT_MASK
+            # layer index becomes the "shell" for this trajectory
+            self.trajectory.append((self.layer, ring, node, slot))
         return out
 
     # ── anticipate: speculative prefetch on the side stream ─────────────

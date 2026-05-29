@@ -291,10 +291,35 @@ class Handler(BaseHTTPRequestHandler):
                             "live": True,
                         }
             except Exception: pass
+            # Trajectory ray + alignment for the visualizer's vertical axis HUD.
+            # Reads the streamer's current `trajectory` list (if any) and
+            # computes the cos(θ) alignment of the ray against the cardinal
+            # "up" axis. Range [-1, +1]: +1 = perfect upward resonance,
+            # -1 = perfect downward (chakras inverted), 0 = scattered.
+            alignment_data = None
+            try:
+                from vertical_axis import Ray, cos_alignment, alignment_reading, ray_to_zegodie
+                # the trajectory cells live on whichever streamer is active
+                # — convention: an attribute named _active_trajectory on the
+                # server module (set by chat handler), or empty
+                traj = globals().get("_active_trajectory", [])
+                if traj:
+                    ray = Ray(cells=tuple(traj))
+                    a = cos_alignment(ray)
+                    zg = ray_to_zegodie(ray)
+                    alignment_data = {
+                        "cos_alignment": round(a, 4),
+                        "reading": alignment_reading(ray),
+                        "n_cells_in_ray": len(traj),
+                        "zegodie_faces": list(zg.faces),
+                        "zegodie_index": zg.to_index(),
+                    }
+            except Exception: pass
             payload = {"ok": True, "device": DEVICE,
                        "loaded": list(_loaded.keys()),
                        "active_holorite": _current_path or "",
-                       "last_stats": live or _last_chat_stats}
+                       "last_stats": live or _last_chat_stats,
+                       "trajectory": alignment_data}
             return self._send_json(200, payload)
         return self._send_json(404, {"error": "not found"})
 
