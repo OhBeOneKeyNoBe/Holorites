@@ -45,8 +45,25 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gguf import GGUFReader
 
 
-def chunkify_moe_experts(gguf_path: str, out_path: Optional[str] = None
-                         ) -> str:
+def _load_ring_layout(ring_layout_path: Optional[str]):
+    """Read a hexagram_ring_planner output and return {layer_idx:int →
+    {ring_idx:int → [expert_ids in node order]}}. Returns None if no
+    path supplied (chunkifier falls back to eid-major writes)."""
+    if not ring_layout_path: return None
+    with open(ring_layout_path, encoding="utf-8") as f:
+        d = json.load(f)
+    rings = d.get("rings") or d
+    out = {}
+    for L, layer_rings in rings.items():
+        out[int(L)] = {int(r): [int(e) for e in eids]
+                       for r, eids in layer_rings.items()}
+    print(f"[chunkify] ring layout loaded: {len(out)} layers, "
+          f"{len(next(iter(out.values())))} rings/layer")
+    return out
+
+
+def chunkify_moe_experts(gguf_path: str, out_path: Optional[str] = None,
+                         ring_layout_path: Optional[str] = None) -> str:
     """Write a per-expert-contiguous sidecar. Returns the .chunks path.
 
     Total disk cost ≈ total bytes of all `*_exps` tensors (the existing
@@ -56,11 +73,19 @@ def chunkify_moe_experts(gguf_path: str, out_path: Optional[str] = None
 
     For NVMe-tight setups, this can be deferred — the standard per-tensor
     slice path still works; it just doesn't get the sequential-read win.
+
+    If `ring_layout_path` is supplied (from `hexagram_ring_planner.py`),
+    experts are written in (layer, ring, node) order instead of
+    (layer, expert_id) order — making ring-adjacent experts byte-adjacent
+    on disk so a single pread loads the whole ring. The index JSON gains
+    a `ring_layout` block per layer so the streamer can look up
+    "where do ring 47's experts live" in O(1).
     """
     gguf_path = str(Path(gguf_path).resolve())
     out_path = out_path or (gguf_path + ".chunks")
     index_path = out_path + ".json"
     r = GGUFReader(gguf_path)
+    ring_layout = _load_ring_layout(ring_layout_path)
 
     # discover layers + their packed expert tensors
     import re
@@ -123,7 +148,29 @@ def chunkify_moe_experts(gguf_path: str, out_path: Optional[str] = None
         gate_raw = np.asarray(gate.data).view(np.uint8).reshape(-1)
         up_raw   = np.asarray(up.data).view(np.uint8).reshape(-1)
         down_raw = np.asarray(down.data).view(np.uint8).reshape(-1)
-        for eid in range(n_experts):
+
+        # Determine the write order. With a ring layout we walk rings
+        # 0..63 then nodes 0..63 within each ring, so adjacent rings
+        # on the torus map to byte-adjacent slabs on disk. Without a
+        # layout we fall back to eid-major (the original behavior).
+        if ring_layout is not None and li in ring_layout:
+            write_order: list[tuple[int, int, int]] = []  # (eid, ring, node)
+            for ring_id in sorted(ring_layout[li].keys()):
+                for node_id, eid in enumerate(ring_layout[li][ring_id]):
+                    write_order.append((int(eid), int(ring_id), int(node_id)))
+            layer_index["ring_layout"] = {
+                str(r): [int(e) for e in eids]
+                for r, eids in ring_layout[li].items()
+            }
+            layer_index["order"] = "ring_major"
+        else:
+            write_order = [(eid, -1, -1) for eid in range(n_experts)]
+            layer_index["order"] = "eid_major"
+
+        # eid → entry pointer so the streamer can index by either eid
+        # or (ring, node) and find the same slab
+        eid_to_entry: dict[int, int] = {}
+        for (eid, ring_id, node_id) in write_order:
             gate_bytes = gate_raw[eid * gate_per : (eid + 1) * gate_per]
             up_bytes   = up_raw[eid * up_per     : (eid + 1) * up_per]
             down_bytes = down_raw[eid * down_per : (eid + 1) * down_per]
@@ -132,15 +179,20 @@ def chunkify_moe_experts(gguf_path: str, out_path: Optional[str] = None
             out_f.write(up_bytes.tobytes())
             out_f.write(down_bytes.tobytes())
             expert_size = gate_per + up_per + down_per
+            entry_idx = len(layer_index["experts"])
             layer_index["experts"].append({
-                "expert_id": eid,
+                "expert_id": int(eid),
+                "ring": ring_id,
+                "node": node_id,
                 "offset": expert_offset,
                 "size": expert_size,
                 "gate_offset": expert_offset,
                 "up_offset":   expert_offset + gate_per,
                 "down_offset": expert_offset + gate_per + up_per,
             })
+            eid_to_entry[int(eid)] = entry_idx
             cursor += expert_size
+        layer_index["eid_to_entry_index"] = eid_to_entry
         index["layers"][str(li)] = layer_index
         if (li + 1) % 8 == 0:
             print(f"  layers 0..{li} written; sidecar size {cursor/1024**3:.2f} GiB")
@@ -155,11 +207,20 @@ def chunkify_moe_experts(gguf_path: str, out_path: Optional[str] = None
 def load_chunked_expert(chunks_path: str, layer: int, expert_id: int
                         ) -> dict:
     """Read one expert's contiguous slab via a single pread.
-    Returns {gate_bytes, up_bytes, down_bytes, gate_shape, ...}."""
+    Returns {gate_bytes, up_bytes, down_bytes, gate_shape, ...}.
+
+    Works for both eid-major (old layout) and ring-major (new layout)
+    sidecars: ring-major sidecars carry an `eid_to_entry_index` mapping
+    so eid → physical slot still resolves in O(1)."""
     index_path = chunks_path + ".json"
     with open(index_path, encoding="utf-8") as f: idx = json.load(f)
     layer_info = idx["layers"][str(layer)]
-    e = layer_info["experts"][expert_id]
+    eid_map = layer_info.get("eid_to_entry_index")
+    if eid_map is not None:
+        entry_idx = int(eid_map.get(str(expert_id), eid_map.get(expert_id, expert_id)))
+        e = layer_info["experts"][entry_idx]
+    else:
+        e = layer_info["experts"][expert_id]
     with open(chunks_path, "rb") as f:
         f.seek(e["offset"])
         full = f.read(e["size"])
@@ -180,9 +241,14 @@ def load_chunked_expert(chunks_path: str, layer: int, expert_id: int
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage:  py expert_chunkifier.py <moe.gguf> [out_chunks_path]")
-        sys.exit(1)
-    src = sys.argv[1]
-    out = sys.argv[2] if len(sys.argv) >= 3 else None
-    chunkify_moe_experts(src, out)
+    import argparse
+    p = argparse.ArgumentParser(
+        description="Chunkify MoE experts; optionally lay out by hexagram ring.")
+    p.add_argument("gguf", help="Path to the MoE .gguf")
+    p.add_argument("--out", default=None,
+                   help="Output .chunks path (default: <gguf>.chunks)")
+    p.add_argument("--ring-layout", default=None,
+                   help="Path to ring_layout.json from hexagram_ring_planner; "
+                        "without this, falls back to expert-id-major order.")
+    a = p.parse_args()
+    chunkify_moe_experts(a.gguf, a.out, a.ring_layout)

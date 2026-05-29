@@ -16,9 +16,10 @@ per token:
 Multi-layer sequential generation supported via KVCache + generate_tokens.
 """
 from __future__ import annotations
-import os, sys, time, math
+import os, sys, time, math, json, threading, atexit
 from pathlib import Path
 from dataclasses import dataclass
+from typing import Optional
 import numpy as np
 import torch
 
@@ -27,6 +28,44 @@ from moe_streamer import (MoEAssetTree, ExpertStreamer, CacheTiers,
                            RoutingHistogram)
 import moe_kernels as mk
 from gguf import GGMLQuantizationType
+
+
+# ─── routing-trace emitter (Hook A) ───────────────────────────────────────
+# When env var HOLORITE_TRACE=<path> is set, every MoE layer's gate top-k
+# selection for the currently-decoding token is appended to <path> as JSONL:
+#   {"token": <id>, "layer": <li>, "top_k_experts": [...], "position": <p>}
+# The trace feeds `hexagram_ring_planner.py` to build the I-Ching-keyed
+# ring layout. Disabled by default; cheap when active (one line per layer
+# per token, written buffered).
+_TRACE_FP = None
+_TRACE_LOCK = threading.Lock()
+_TRACE_TLS = threading.local()    # holds .token_id and .position per thread
+
+def _trace_open():
+    global _TRACE_FP
+    if _TRACE_FP is not None: return
+    path = os.environ.get("HOLORITE_TRACE")
+    if not path: return
+    _TRACE_FP = open(path, "a", encoding="utf-8", buffering=1<<16)
+    atexit.register(lambda: _TRACE_FP and _TRACE_FP.close())
+
+def _trace_set_token(token_id: int, position: int):
+    _TRACE_TLS.token_id = int(token_id)
+    _TRACE_TLS.position = int(position)
+
+def _trace_record(layer_idx: int, top_k_eids):
+    if _TRACE_FP is None: return
+    tid = getattr(_TRACE_TLS, "token_id", None)
+    if tid is None: return
+    line = {"token": int(tid),
+            "layer": int(layer_idx),
+            "top_k_experts": [int(e) for e in top_k_eids],
+            "position": getattr(_TRACE_TLS, "position", -1)}
+    s = json.dumps(line, separators=(",", ":")) + "\n"
+    with _TRACE_LOCK:
+        _TRACE_FP.write(s)
+
+_trace_open()
 
 
 # ─── one-shot dequant for non-expert tensors (attention, norms, gates) ───
@@ -200,6 +239,18 @@ def moe_layer_forward(hidden: torch.Tensor,
     # Which experts are needed across ALL tokens in this layer's batch?
     unique_eids = sorted(set(topk_idx.flatten().tolist()))
     if trace is not None: trace["n_unique_experts"] = len(unique_eids)
+    # Hook A: record per-token-per-layer top-k routing for the planner.
+    # In T=1 decode, topk_idx[0] is exactly this token's top-k experts;
+    # in T>1 prefill we record each row separately so the trace stays
+    # per-token.
+    if _TRACE_FP is not None:
+        if T == 1:
+            _trace_record(layer_idx, topk_idx[0].tolist())
+        else:
+            # prefill: caller's thread-local token doesn't correspond to
+            # the multiple tokens in T; skip prefill rows (the trace tool
+            # already gets full coverage from decode steps)
+            pass
 
     # ── streamer batched admit (DeepEP / DeepGEMM pattern) ──
     t0 = time.perf_counter()
@@ -375,6 +426,8 @@ class LoadedQwen3MoE:
     embed_w:     torch.Tensor
     output_norm: torch.Tensor
     output_w:    torch.Tensor
+    # optional sidecar chunks index (ring layout); None if no sidecar
+    chunks_index: Optional[dict] = None
 
 
 def load_qwen3_moe(gguf_path: str, device: str = "cuda") -> LoadedQwen3MoE:
@@ -417,6 +470,15 @@ def load_qwen3_moe(gguf_path: str, device: str = "cuda") -> LoadedQwen3MoE:
     output_w = load_w(tree.globals["output.weight"]).view(tree.vocab_size, tree.hidden_dim).contiguous()
     output_norm = load_w(tree.globals["output_norm.weight"])
     print(f"  embedding: {tuple(embed_w.shape)}, output: {tuple(output_w.shape)}")
+    # Auto-discover the chunks sidecar index. With a ring layout present,
+    # the streamer's strand walker (Hook C) drives prefetch; without it,
+    # the existing geometric/histogram path is used.
+    from moe_streamer import load_chunks_index
+    chunks_path = os.environ.get("HOLORITE_CHUNKS") or (gguf_path + ".chunks")
+    cidx = load_chunks_index(chunks_path)
+    if cidx is not None:
+        print(f"[load] chunks index loaded: {chunks_path}.json "
+              f"(order={cidx['layers']['0'].get('order','?')})")
     return LoadedQwen3MoE(
         tree=tree, device=torch.device(device),
         hidden_dim=tree.hidden_dim, n_layers=tree.n_layers,
@@ -427,14 +489,22 @@ def load_qwen3_moe(gguf_path: str, device: str = "cuda") -> LoadedQwen3MoE:
         q_norm=q_norm, k_norm=k_norm,
         attn_norm_w=attn_norm_w, ffn_norm_w=ffn_norm_w, router_gate=router_gate,
         embed_w=embed_w, output_norm=output_norm, output_w=output_w,
+        chunks_index=cidx,
     )
 
 
 def forward_one_token(model: LoadedQwen3MoE, token_id: int,
-                       streamers: dict, kv_cache: dict, position: int
-                       ) -> torch.Tensor:
+                       streamers: dict, kv_cache: dict, position: int,
+                       heart=None) -> torch.Tensor:
     """Full Qwen3-MoE forward for ONE token at the given position.
-    Returns the logits over vocab (vocab_size,)."""
+    Returns the logits over vocab (vocab_size,).
+
+    If `heart` is a NestedHeart, its `at_layer(x, li, position)` is
+    called after each outer layer's compute — passthrough at non-
+    insertion layers, residual-blend at the insertion layer."""
+    # Hook A: thread-local current-token state so moe_layer_forward can
+    # tag each routing record with the actual token id + position.
+    _trace_set_token(token_id, position)
     x = model.embed_w[token_id].view(1, model.hidden_dim).contiguous()
     positions = torch.tensor([position], device=model.device)
     for li in range(model.n_layers):
@@ -451,13 +521,34 @@ def forward_one_token(model: LoadedQwen3MoE, token_id: int,
         s = streamers.get(li)
         if s is None:
             from moe_streamer import ExpertStreamer, CacheTiers
-            s = ExpertStreamer(model.tree, layer=li, tiers=CacheTiers(hot=64, warm=128),
-                                compute_device=model.device)
+            # Task #9: derive tier sizes from VRAM budget. Cache the plan
+            # at model-level so it's computed once across all layers.
+            tiers = getattr(model, "_cache_tiers", None)
+            if tiers is None:
+                from vram_budget import plan_budget, OUTER_PROFILES
+                arch_nonexp, mb_each, _ = OUTER_PROFILES.get(
+                    "qwen3moe_coder_q4_k_m", (1024, 9.4, model.n_layers))
+                heart_mb = (heart.heart_resident_mb_estimate
+                            if heart is not None and hasattr(heart, "heart_resident_mb_estimate")
+                            else 0)
+                plan = plan_budget(outer_nonexpert_mb=arch_nonexp,
+                                   heart_resident_mb=heart_mb,
+                                   expert_mb_each=mb_each,
+                                   n_layers=model.n_layers)
+                print(f"[forward] {plan.summary()}")
+                tiers = CacheTiers(hot=plan.hot, warm=plan.warm)
+                model._cache_tiers = tiers
+            s = ExpertStreamer(model.tree, layer=li, tiers=tiers,
+                                compute_device=model.device,
+                                chunks_index=model.chunks_index)
             streamers[li] = s
         moe_out = moe_layer_forward(
             x, li, model.tree, s, model.ffn_norm_w[li],
             model.router_gate[li], k=model.k)
         x = x + moe_out
+        # NestedHeart hook: identity at !=M, residual-blend at M.
+        if heart is not None:
+            x = heart.at_layer(x, li, position)
     x = rms_norm(x, model.output_norm, model.rms_eps)
     return (x @ model.output_w.T).view(-1)
 

@@ -19,3 +19,28 @@ stream-*/
 # Chunkified asset trees (per-tensor .chunk + .meta.json files)
 chunktree-*/
 *.chunk
+
+# v0.9 ring-layout sidecar (regenerable from expert_chunkifier.py)
+*.chunks
+*.chunks.json
+
+# Routing traces (regenerable from run_trace.py / run_diverse_trace.py)
+trace*.jsonl
+synthetic_trace*.jsonl
+
+# Planner outputs (regenerable from hexagram_ring_planner.py)
+*_ring_layout.json
+synthetic_ring_layout.json
+ring_layout.json
+
+# Extracted hexagram identities (regenerable from extract_identities.py)
+identities.json
+
+# Scratch / probe artifacts
+.trace_run_env
+nan_probe*.log
+heart_shape.log
+expert_nan_scan.log
+chunkify.log
+trace*_run.log
+

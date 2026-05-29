@@ -50,7 +50,7 @@ What the streamer doesn't do (and shouldn't):
     granular path. This module is the expert-axis extension on top.
 """
 from __future__ import annotations
-import os, sys, time, threading, queue
+import os, sys, time, threading, queue, json
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -62,7 +62,64 @@ import gguf
 from gguf import GGUFReader, ReaderTensor, GGMLQuantizationType
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from torus_lattice import RING_BITS, NODE_BITS, SLOT_BITS, RING_MASK, NODE_MASK, SLOT_MASK
+from torus_lattice import (RING_BITS, NODE_BITS, SLOT_BITS,
+                            RING_MASK, NODE_MASK, SLOT_MASK,
+                            SPIRAL_Q)
+
+
+# ─── strand walker (videogram receiver) ───────────────────────────────────
+
+class StrandWalker:
+    """Deterministic ring sequence for the prefetch stream.
+
+    User's "videogram" insight: with the hexagram-keyed ring layout in
+    place, prefetch stops being a prediction problem. Once the gate
+    names a starting ring, the helical step (SPIRAL_Q=1, coprime with
+    64) gives the next ring positions in a fixed strand — the cache
+    just *receives* those positions like a video lookahead buffer.
+
+    The walk is one-dimensional per shell: ring → ring+1 → ring+2 →
+    … mod 64. (Node and slot positions are NOT walked — we admit
+    the ring's root node for each predicted ring; if the gate picks
+    a deviation node it lives in the same ring, so the strand still
+    landed in the right neighborhood.)
+    """
+    __slots__ = ("step",)
+
+    def __init__(self, step: int = SPIRAL_Q):
+        # step coprime with 64 → walking k steps gives k DISTINCT rings
+        self.step = int(step) if (int(step) & 1) else 1
+
+    def walk(self, start_ring: int, k: int) -> list[int]:
+        """k ring positions starting one step past `start_ring`."""
+        r = int(start_ring) & RING_MASK
+        out = []
+        for i in range(1, k + 1):
+            out.append((r + i * self.step) & RING_MASK)
+        return out
+
+    def walk_from_many(self, start_rings: Iterable[int], k_each: int
+                       ) -> list[int]:
+        """Walk from each starting ring; deduplicate while preserving
+        the strand order. The earliest-seen position wins."""
+        seen: set[int] = set()
+        out: list[int] = []
+        for sr in start_rings:
+            for r in self.walk(sr, k_each):
+                if r in seen: continue
+                seen.add(r)
+                out.append(r)
+        return out
+
+
+def load_chunks_index(chunks_path: str) -> Optional[dict]:
+    """Read the sidecar's <chunks>.json. Returns None if missing — the
+    streamer falls back to its non-layout path in that case."""
+    if not chunks_path: return None
+    p = Path(str(chunks_path) + ".json")
+    if not p.exists(): return None
+    with open(p, encoding="utf-8") as f:
+        return json.load(f)
 
 
 class _NoCtx:
@@ -354,7 +411,8 @@ class ExpertStreamer:
                  compute_device: torch.device | str,
                  fp_dtype: torch.dtype = torch.float16,
                  histogram: Optional[RoutingHistogram] = None,
-                 trajectory: Optional[list] = None):
+                 trajectory: Optional[list] = None,
+                 chunks_index: Optional[dict] = None):
         self.tree = tree
         self.layer = layer
         self.tiers = tiers
@@ -362,6 +420,24 @@ class ExpertStreamer:
         self.fp_dtype = fp_dtype
         # discover the layer's expert map
         self.assets = tree.expert_assets(layer)
+        # Optional: chunks-sidecar index from expert_chunkifier (used to
+        # resolve eid → ring + node and to drive the strand walker). The
+        # index is loaded once per layer and is tiny (a few KiB/layer).
+        self.ring_of_eid: dict[int, int] = {}    # eid → ring (0..63)
+        self.node_of_eid: dict[int, int] = {}    # eid → node within ring
+        self.ring_to_eids: dict[int, list[int]] = {}   # ring → [eid by node]
+        if chunks_index is not None:
+            li_info = chunks_index.get("layers", {}).get(str(layer), {})
+            ring_layout = li_info.get("ring_layout")
+            if ring_layout:
+                for r_str, eids in ring_layout.items():
+                    r = int(r_str)
+                    self.ring_to_eids[r] = [int(e) for e in eids]
+                    for node_i, e in enumerate(eids):
+                        self.ring_of_eid[int(e)] = r
+                        self.node_of_eid[int(e)] = node_i
+        self.strand = StrandWalker(step=SPIRAL_Q)
+        self._recent_rings: list[int] = []      # rings touched on the last route call
         # LRU caches (key = expert_id)
         self.gpu: OrderedDict[int, dict[str, torch.Tensor]] = OrderedDict()
         self.host: OrderedDict[int, dict[str, torch.Tensor]] = OrderedDict()
@@ -605,6 +681,19 @@ class ExpertStreamer:
                         except Exception: pass
                 self.gpu[eid] = gpu_dict
                 out[eid] = gpu_dict
+        # CROSS-STREAM FENCE (NaN fix, task #12).
+        # The admits above ran on self.admit_stream; the caller is about
+        # to consume out[*] tensors with bmm on the default compute
+        # stream. Without an explicit fence, the matmul reads garbage
+        # from memory that admit_stream hasn't finished writing yet --
+        # producing NaN downstream. This wait_stream call is a zero-CPU
+        # GPU-side barrier: compute waits for admit_stream's pending
+        # work without blocking the host.
+        if self.admit_stream is not None:
+            try:
+                torch.cuda.current_stream().wait_stream(self.admit_stream)
+            except Exception:
+                pass
         # update the routing histogram so anticipate() learns
         if self.histogram is not None:
             self.histogram.update(self.layer, expert_ids)
@@ -612,14 +701,23 @@ class ExpertStreamer:
         # admitted expert at this layer adds a cell to the ray. The
         # vertical_axis module reads these cells back as cos_alignment —
         # the "verticality" of the answer along its trajectory.
+        rings_this_call: list[int] = []
         for eid in expert_ids:
-            # decompose expert id into (ring, node, slot) for the expert axis
-            # so the cell coordinates are uniform across all axes
-            ring = (eid >> (NODE_BITS + SLOT_BITS)) & RING_MASK
-            node = (eid >> SLOT_BITS) & NODE_MASK
-            slot = eid & SLOT_MASK
-            # layer index becomes the "shell" for this trajectory
+            # Use the LAYOUT-derived ring assignment when available
+            # (semantic ring from the hexagram planner). Fall back to
+            # the bit-slice of the raw eid only when no layout is loaded.
+            if eid in self.ring_of_eid:
+                ring = self.ring_of_eid[eid]
+                node = self.node_of_eid.get(eid, 0)
+                slot = eid & SLOT_MASK
+            else:
+                ring = (eid >> (NODE_BITS + SLOT_BITS)) & RING_MASK
+                node = (eid >> SLOT_BITS) & NODE_MASK
+                slot = eid & SLOT_MASK
             self.trajectory.append((self.layer, ring, node, slot))
+            rings_this_call.append(ring)
+        # keep the last few rings so anticipate() can walk strands from them
+        self._recent_rings = rings_this_call
         return out
 
     # ── anticipate: speculative prefetch on the side stream ─────────────
@@ -648,7 +746,31 @@ class ExpertStreamer:
         """
         if self.prefetch_stream is None: return
         predicted: list[int] = []
-        if use_geometric and recent_eids:
+        # ── STRAND path (videogram receiver) ──
+        # If the chunkifier has installed a ring layout, this is the
+        # only path that matters: walk the strand from the rings the
+        # gate just touched, take each predicted ring's root node, and
+        # admit. No probability distribution computed; the geometry IS
+        # the route. Falls back to the legacy paths only when no layout
+        # is loaded (eg. first-run sidecars without ring metadata).
+        if self.ring_to_eids and self._recent_rings:
+            # walk ~ceil(fanout / starts) rings from each recently-touched ring
+            starts = self._recent_rings[:4]
+            per_start = max(1, fanout // max(1, len(starts)))
+            future_rings = self.strand.walk_from_many(starts, per_start + 1)
+            seen = set(self.gpu.keys()) | self.pinned_eids
+            for r in future_rings:
+                eids_on_r = self.ring_to_eids.get(r, [])
+                if not eids_on_r: continue
+                root_eid = eids_on_r[0]    # ring's root node (hexagram root)
+                if root_eid in seen: continue
+                if root_eid not in self.assets: continue
+                predicted.append(root_eid)
+                seen.add(root_eid)
+                if len(predicted) >= fanout: break
+        if predicted:
+            pass    # strand produced enough — skip legacy paths
+        elif use_geometric and recent_eids:
             try:
                 from geometric_runtime import Address, holo_walk
                 # walk the HoloStream from each recently-routed expert

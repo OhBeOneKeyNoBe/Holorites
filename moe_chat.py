@@ -28,6 +28,14 @@ Example:
 from __future__ import annotations
 import os, sys, time
 from pathlib import Path
+
+# IMPORTANT: set CUDA allocator hint BEFORE importing torch so it takes
+# effect at CUDA init (task #9: nested working-set discipline). Without
+# expandable_segments=True, PyTorch's allocator fragments badly and the
+# nominally-sized tier0 caches OOM at 3-4x their actual byte cost.
+from vram_budget import apply_expandable_segments, plan_budget, OUTER_PROFILES, HEART_PROFILES
+apply_expandable_segments()
+
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -67,11 +75,13 @@ def sample_logits(logits: torch.Tensor, *, temperature: float = 0.7,
 # ─── streamer-driven forward with anticipatory prefetch ──────────────────
 
 def forward_with_prefetch(model, token_id, streamers, histograms, kv_cache,
-                           position):
+                           position, heart=None):
     """Same as moe_forward.forward_one_token but fires anticipate() on each
     layer's streamer after the route call. The histogram tracks recent
     activations; anticipate uses it + geometric walk to prefetch the next
-    likely experts on the side stream during compute."""
+    likely experts on the side stream during compute.
+
+    `heart` is an optional NestedHeart wired into the meridian layer."""
     x = model.embed_w[token_id].view(1, model.hidden_dim).contiguous()
     positions = torch.tensor([position], device=model.device)
     for li in range(model.n_layers):
@@ -91,12 +101,28 @@ def forward_with_prefetch(model, token_id, streamers, histograms, kv_cache,
         if s is None:
             h = RoutingHistogram(n_layers=model.n_layers, n_experts=model.n_routed)
             histograms[li] = h
-            # tier-0 = 16 experts per layer × 48 layers ≈ 1.5 GiB on top of
-            # the ~1 GiB of one-shot non-expert weights + KV cache. This
-            # leaves headroom under the 4 GiB GTX 1650 budget.
+            # Task #9: tier sizes derived from VRAM budget so the streamer
+            # respects the heart's footprint. Cached at model-level so the
+            # plan is computed once, not per-layer.
+            tiers = getattr(model, "_cache_tiers", None)
+            if tiers is None:
+                # Find a profile that matches the loaded arch, else use generic Qwen3 numbers
+                key = "qwen3moe_coder_q4_k_m"
+                arch_nonexp, mb_each, _ = OUTER_PROFILES.get(key, (1024, 9.4, model.n_layers))
+                heart_mb = (heart.heart_resident_mb_estimate
+                            if heart is not None and hasattr(heart, "heart_resident_mb_estimate")
+                            else 0)
+                plan = plan_budget(outer_nonexpert_mb=arch_nonexp,
+                                   heart_resident_mb=heart_mb,
+                                   expert_mb_each=mb_each,
+                                   n_layers=model.n_layers)
+                print(f"[chat] {plan.summary()}")
+                tiers = CacheTiers(hot=plan.hot, warm=plan.warm)
+                model._cache_tiers = tiers
             s = ExpertStreamer(model.tree, layer=li,
-                                tiers=CacheTiers(hot=16, warm=32),
-                                compute_device=model.device, histogram=h)
+                                tiers=tiers,
+                                compute_device=model.device, histogram=h,
+                                chunks_index=model.chunks_index)
             streamers[li] = s
         # the recent eids are tracked in s.trajectory's last entries.
         # Trajectory tuple is (layer, ring, node, slot); reconstruct eid =
@@ -110,6 +136,9 @@ def forward_with_prefetch(model, token_id, streamers, histograms, kv_cache,
         if len(s.trajectory) > 256:
             s.trajectory[:] = s.trajectory[-128:]
         x = x + moe_out
+        # NestedHeart hook (Task #8): identity at !=M, residual-blend at M.
+        if heart is not None:
+            x = heart.at_layer(x, li, position)
     x = rms_norm(x, model.output_norm, model.rms_eps)
     return (x @ model.output_w.T).view(-1)
 
