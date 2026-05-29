@@ -362,21 +362,119 @@ class ExpertStreamer:
 
     # ── admit (the unit of work — analogous to DeepEP `dispatch`) ────────
 
+    def _expert_slab_bytes(self, packed_t: ReaderTensor) -> int:
+        """How many bytes one expert's slab is inside a packed `*_exps` tensor.
+
+        For packed layouts the first axis of the tensor is the expert axis
+        (n_experts × ffn_dim × hidden), and the bytes are laid out
+        per-expert contiguously. Each expert's slab is always block-aligned
+        in the underlying ggml quant (Q4_K = 256-element blocks of 144 B,
+        Q6_K = 256-element blocks of 210 B, Q8_0 = 32-element blocks of 34 B,
+        F16 = 2 B per element) because the GGUF writer pads each row to a
+        block boundary. So integer division of n_bytes by n_experts gives
+        the per-expert slab size exactly.
+        """
+        n_experts = int(packed_t.shape[-1])    # GGUF stores axes in reverse
+        return packed_t.n_bytes // n_experts
+
+    def _slice_expert_from_packed(self, packed_t: ReaderTensor, eid: int
+                                  ) -> tuple[np.ndarray, list[int]]:
+        """Memmap-slice the bytes for one expert out of a packed tensor.
+
+        Returns (bytes_view, per_expert_shape). The bytes_view is still a
+        numpy memmap (no copy into RAM); only the .tobytes() / np.array()
+        call when shipping to GPU realizes a real allocation. This is the
+        16-64× NVMe-traffic reduction that makes MoE sparsity actually
+        translate to sparse disk reads.
+        """
+        slab = self._expert_slab_bytes(packed_t)
+        start = eid * slab
+        end = start + slab
+        # packed_t.data is a numpy memmap view of the GGUF; slice in bytes
+        raw = np.asarray(packed_t.data)
+        flat = raw.view(np.uint8).reshape(-1)
+        byte_view = flat[start:end]
+        # the per-expert shape is (ffn_dim, hidden) for Qwen3 / DeepSeek
+        # — drop the leading n_experts axis from the packed shape
+        per_expert_shape = [int(d) for d in packed_t.shape[:-1]]
+        return byte_view, per_expert_shape
+
+    def _dequant_expert_slab(self, packed_t: ReaderTensor, eid: int
+                             ) -> torch.Tensor:
+        """Slice + dequant for ONE expert out of a packed tensor. Returns
+        an fp16 tensor of shape (ffn_dim, hidden) — the per-expert weight
+        matrix ready to feed a matmul.
+        """
+        byte_view, shape = self._slice_expert_from_packed(packed_t, eid)
+        gt = packed_t.tensor_type
+        import gguf_holoritify as gh
+        # n_elem per expert
+        n = 1
+        for d in shape: n *= d
+        if gt == GGMLQuantizationType.F16:
+            arr = np.asarray(byte_view).view(np.float16).reshape(*shape).copy()
+            t = torch.from_numpy(arr)
+        elif gt == GGMLQuantizationType.BF16:
+            arr = np.asarray(byte_view).view(np.uint16).astype(np.uint32) << 16
+            t = torch.from_numpy(arr.view(np.float32).reshape(*shape).copy()).to(torch.float16)
+        elif gt == GGMLQuantizationType.F32:
+            arr = np.asarray(byte_view).view(np.float32).reshape(*shape).copy()
+            t = torch.from_numpy(arr).to(torch.float16)
+        elif gt == GGMLQuantizationType.Q8_0:
+            blob = bytes(byte_view)
+            t = gh._dequant_q8_0(blob, ((n + 31)//32)*32)[:n].view(*shape).to(torch.float16).contiguous()
+        elif gt == GGMLQuantizationType.Q4_K:
+            blob = bytes(byte_view)
+            QK_K = 256
+            t = gh._dequant_q4_K(blob, ((n + QK_K-1)//QK_K)*QK_K)[:n].view(*shape).to(torch.float16).contiguous()
+        elif gt == GGMLQuantizationType.Q6_K:
+            blob = bytes(byte_view)
+            QK_K = 256
+            t = gh._dequant_q6_K(blob, ((n + QK_K-1)//QK_K)*QK_K)[:n].view(*shape).to(torch.float16).contiguous()
+        elif gt == GGMLQuantizationType.Q4_0:
+            blob = bytes(byte_view)
+            QK = 32
+            t = gh._dequant_q4_0(blob, ((n + QK-1)//QK)*QK)[:n].view(*shape).to(torch.float16).contiguous()
+        else:
+            raise NotImplementedError(f"expert-slab dequant for {gt.name} not wired")
+        return t
+
     def _admit_to_gpu(self, asset: ExpertAsset) -> dict[str, torch.Tensor]:
         """Pull the asset's bytes through to the GPU (synchronous).
 
-        For packed layouts (DeepSeek/Qwen3-MoE), the per-expert tensors are
-        slices of giant `*_exps` tensors — this is the per-expert byte-range
-        addressing we'd implement in a downstream version. For the prototype
-        we copy the whole packed tensor on first touch, then index per call.
+        For PACKED layouts (DeepSeek/Qwen3-MoE), this slices the per-expert
+        byte range out of each `*_exps` tensor — so only ~1/n_experts of
+        the packed bytes get touched. That's the actual MoE-sparsity win:
+        for 8-of-128 routing on Qwen3-Coder, 16× less NVMe traffic per
+        token; for V4-Pro's 6-of-385, 64×.
+
+        For PER-EXPERT layouts (Mixtral), each tensor is already that
+        expert's slab — no slicing needed, just read.
+
+        For SHARED expert tensors (DeepSeek), same — read the whole tensor.
         """
         out: dict[str, torch.Tensor] = {}
+        eid = asset.expert_id
         for name, t in asset.tensors.items():
-            # ReaderTensor.data is a numpy view of the GGUF mmap (no copy)
-            arr = np.array(t.data)   # forces a real copy into RAM
-            ten = torch.from_numpy(arr)
-            ten = ten.to(self.compute_device, non_blocking=True)
-            out[name] = ten
+            # Detect packed vs unpacked: packed if tensor has n_experts axis
+            # and the asset is a routed (non-shared) expert.
+            is_packed_routed = (not asset.is_shared
+                                and "_exps" in name
+                                and int(t.shape[-1]) > 1
+                                and eid >= 0)
+            if is_packed_routed:
+                # canonicalize the sub-name to "ffn_gate" / "ffn_up" / "ffn_down"
+                # (drop the "_exps" suffix so the consumer can index by role)
+                canonical = name.replace("_exps", "")
+                ten = self._dequant_expert_slab(t, eid).to(
+                    self.compute_device, non_blocking=True)
+                out[canonical] = ten
+            else:
+                # whole-tensor path: shared expert, per-expert (Mixtral) layout,
+                # or fp16/bf16 small tensors. Always dequant the full bytes.
+                arr = np.array(t.data)
+                ten = torch.from_numpy(arr).to(self.compute_device, non_blocking=True)
+                out[name] = ten
         self.t_pages_in += 1
         return out
 
