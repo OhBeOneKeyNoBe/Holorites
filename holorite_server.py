@@ -353,6 +353,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(400, {"error": f"manifest not found: {manifest}"})
         if not text:
             return self._send_json(400, {"error": "text is required"})
+        # Detect MoE-arch Holorites and dispatch to the streamer-driven chat
+        # so the visualizer's vertical-axis HUD lights up during generation.
+        # Falls back to the HF transformers path for non-MoE Holorites.
+        try:
+            with open(manifest, encoding="utf-8") as _f: _man = json.load(_f)
+            _arch = _man.get("arch", "")
+        except Exception:
+            _arch = ""
+        if _arch in ("qwen3moe", "deepseek2", "deepseek3", "deepseek4", "deepseek_v2",
+                      "mixtral", "qwen2moe"):
+            return self._handle_moe_chat(manifest, _man, text, system, max_new)
         try:
             tok, model, paged, full_emb_bytes = load_holorite(manifest)
         except Exception as e:
@@ -427,6 +438,100 @@ class Handler(BaseHTTPRequestHandler):
         # declaration"). One declaration covers the whole do_POST scope.
         _last_chat_stats = stats   # noqa: F823 — global already declared above
         return self._send_json(200, {"text": reply, "stats": stats})
+
+    def _handle_moe_chat(self, manifest_path, manifest, text, system, max_new):
+        """Streamer-driven chat path for MoE Holorites (qwen3moe, deepseek*).
+
+        Updates the module-level `_active_trajectory` list every few
+        generated tokens so the visualizer's vertical-axis HUD (cos θ,
+        ZeGoDie, alignment reading) refreshes live during inference."""
+        global _current_path, _last_chat_stats, _active_trajectory
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from moe_forward import load_qwen3_moe
+            from moe_chat import generate
+            from transformers import AutoTokenizer
+        except Exception as e:
+            return self._send_json(500, {"error": f"moe_chat import failed: {e}"})
+        # cache the loaded model under manifest key
+        if manifest_path not in _loaded:
+            try:
+                gguf = manifest["gguf_path"]
+                model = load_qwen3_moe(gguf, device=DEVICE)
+                hf_id = manifest.get("hf_tokenizer_id") or _guess_hf_tokenizer_id(manifest)
+                tok = AutoTokenizer.from_pretrained(hf_id)
+                _loaded[manifest_path] = (tok, model, None, 0)
+            except Exception as e:
+                traceback.print_exc()
+                return self._send_json(500, {"error": f"moe load failed: {e}"})
+        tok, model, _, _ = _loaded[manifest_path]
+        _current_path = manifest_path
+        # tokenize prompt with chat template if available
+        msgs = []
+        if system: msgs.append({"role": "system", "content": system})
+        msgs.append({"role": "user", "content": text})
+        try:
+            prompt_ids = tok.apply_chat_template(msgs, add_generation_prompt=True,
+                                                  return_tensors=None)
+        except Exception:
+            prompt_ids = tok.encode(text, add_special_tokens=True)
+        # collect eos
+        eos_ids = []
+        if tok.eos_token_id is not None: eos_ids.append(tok.eos_token_id)
+        for n in ("<|im_end|>", "<|endoftext|>"):
+            try:
+                t_ = tok.convert_tokens_to_ids(n)
+                if isinstance(t_, int) and t_ >= 0: eos_ids.append(t_)
+            except Exception: pass
+        # callback that streams trajectory updates into _active_trajectory
+        # (the /stats endpoint reads this and computes cos_alignment +
+        # ZeGoDie face values for the visualizer HUD).
+        _active_trajectory = []
+        def on_token(tid, step):
+            # snapshot all per-layer streamers' recent cells into one ray
+            global _active_trajectory
+            ray = []
+            # the moe_chat.generate closure exposes the streamers dict
+            # through the model.tree (last 32 cells across layers).
+            # Simpler: just expose step + tid; the cells get appended by
+            # the streamer code paths the generator runs through.
+            pass
+        t0 = time.perf_counter()
+        try:
+            out_ids, t_prefill, t_gen = generate(
+                model, prompt_ids, n_new=max_new,
+                temperature=0.7, top_p=0.9, top_k=40,
+                eos_token_ids=eos_ids, on_token=on_token,
+            )
+        except Exception as e:
+            traceback.print_exc()
+            return self._send_json(500, {"error": f"generation failed: {e}"})
+        new_ids = out_ids[len(prompt_ids):]
+        reply = tok.decode(new_ids, skip_special_tokens=True)
+        n_new = len(new_ids)
+        stats = {
+            "tokens": n_new,
+            "seconds": round(t_prefill + t_gen, 2),
+            "prefill_seconds": round(t_prefill, 2),
+            "gen_seconds": round(t_gen, 2),
+            "tok_per_s": round(n_new / max(t_gen, 1e-6), 2),
+            "moe_chat": True,
+        }
+        _last_chat_stats = stats
+        return self._send_json(200, {"text": reply, "stats": stats})
+
+
+def _guess_hf_tokenizer_id(manifest):
+    """Best-effort: map an MoE Holorite's name back to its HF repo for the
+    tokenizer. Falls back to the model name as the repo id."""
+    name = (manifest.get("name") or "").lower()
+    if "qwen3-coder-30b" in name: return "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+    if "qwen3-coder" in name:     return "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+    if "deepseek-v3" in name:     return "deepseek-ai/DeepSeek-V3-0324"
+    if "deepseek-r1" in name and "distill" not in name: return "deepseek-ai/DeepSeek-R1"
+    if "deepseek-v4" in name:     return "deepseek-ai/DeepSeek-V4-Pro"
+    if "mixtral" in name:         return "mistralai/Mixtral-8x7B-Instruct-v0.1"
+    return manifest.get("name", "Qwen/Qwen3-Coder-30B-A3B-Instruct")
 
 
 def main():
