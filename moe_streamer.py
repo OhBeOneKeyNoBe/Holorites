@@ -181,6 +181,14 @@ class MoEAssetTree:
                     except Exception: return None
             return None
         self.arch = kvstr("general.architecture") or "unknown"
+        # vocab — try metadata first, fall back to the embedding tensor's
+        # GGUF shape (last axis), since some Qwen3 dumps don't write the
+        # vocab_size metadata key.
+        embed_tensor = None
+        for t in self.reader.tensors:
+            if t.name in ("token_embd.weight", "tok_embeddings.weight", "wte.weight"):
+                embed_tensor = t; break
+        vocab_from_embed = int(embed_tensor.shape[-1]) if embed_tensor is not None else 0
         self.n_layers = (kvget(f"{self.arch}.block_count",
                                f"{self.arch}.n_layer") or 0)
         self.n_routed = (kvget(f"{self.arch}.expert_count",
@@ -192,7 +200,7 @@ class MoEAssetTree:
                                        f"{self.arch}.n_expert_per_token") or 0)
         self.hidden_dim   = kvget(f"{self.arch}.embedding_length",
                                   f"{self.arch}.hidden_size") or 0
-        self.vocab_size   = kvget(f"{self.arch}.vocab_size") or 0
+        self.vocab_size   = (kvget(f"{self.arch}.vocab_size") or vocab_from_embed or 0)
         self.moe_intermediate = kvget(f"{self.arch}.expert_feed_forward_length",
                                        f"{self.arch}.moe_intermediate_size") or 0
         # index tensors by layer + role
