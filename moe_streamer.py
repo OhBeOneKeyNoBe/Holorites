@@ -563,24 +563,60 @@ class ExpertStreamer:
 
     # ── anticipate: speculative prefetch on the side stream ─────────────
 
-    def anticipate(self, fanout: int = 8):
+    def anticipate(self, fanout: int = 8, *, recent_eids: list = None,
+                   use_geometric: bool = True):
         """Prefetch the top-`fanout` likely-next experts on the side stream.
 
-        This is the inference-time analogue of DeepSeek's anticipatory
-        routing — it predicts which experts will be needed soon based on
-        the histogram's recent-window hit rate. The prefetch happens during
-        the current token's compute, so its PCIe traffic hides under the
-        matmul (DualPipe's mutual-hiding principle).
+        Two prediction strategies (use_geometric chooses):
+
+          GEOMETRIC (default) — uses geometric_runtime.holo_walk to
+            predict the next experts along the HoloStream from the most
+            recently routed ones. If the chunkifier laid experts out so
+            co-routed pairs sit on adjacent Stream IDs, walking the
+            HoloStream from the active expert IS predicting the next
+            most-likely expert by geometry, not by post-hoc statistics.
+
+          HISTOGRAM — falls back to the routing-frequency tracker. Top-k
+            most-frequently-routed experts get prefetched. Useful as a
+            baseline + when the chunkifier hasn't yet laid out co-routing
+            information.
+
+        Both paths fire on the side CUDA stream so the PCIe traffic
+        hides under the current token's compute (DualPipe's mutual-
+        computation-communication hiding pattern).
         """
-        if self.histogram is None or self.prefetch_stream is None: return
-        predicted = self.histogram.top_predicted(self.layer, fanout)
+        if self.prefetch_stream is None: return
+        predicted: list[int] = []
+        if use_geometric and recent_eids:
+            try:
+                from geometric_runtime import Address, holo_walk
+                # walk the HoloStream from each recently-routed expert
+                seen = set(recent_eids) | set(self.gpu.keys()) | self.pinned_eids
+                for eid in recent_eids[:4]:    # take 4 active experts as walk starting points
+                    addr = Address.expert(layer_idx=self.layer, expert_id=eid)
+                    walked = holo_walk(addr, fanout)
+                    for w_addr in walked:
+                        w_eid = w_addr.primary[1]
+                        if w_eid in seen: continue
+                        if w_eid < 0 or w_eid not in self.assets: continue
+                        predicted.append(w_eid)
+                        seen.add(w_eid)
+                        if len(predicted) >= fanout: break
+                    if len(predicted) >= fanout: break
+            except Exception: pass
+        if not predicted and self.histogram is not None:
+            # histogram fallback
+            top = self.histogram.top_predicted(self.layer, fanout * 2)
+            for eid in top:
+                if eid in self.gpu or eid in self.pinned_eids: continue
+                predicted.append(eid)
+                if len(predicted) >= fanout: break
         for eid in predicted:
             if eid in self.gpu or eid in self.pinned_eids: continue
             if eid not in self.assets: continue
             try:
                 with torch.cuda.stream(self.prefetch_stream):
                     gpu_dict = self._admit_to_gpu(self.assets[eid])
-                # only insert if there's room (don't evict during prefetch)
                 if len(self.gpu) < self.tiers.hot:
                     self.gpu[eid] = gpu_dict
                     self.t_prefetches += 1
