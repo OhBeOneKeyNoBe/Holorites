@@ -65,6 +65,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from torus_lattice import RING_BITS, NODE_BITS, SLOT_BITS, RING_MASK, NODE_MASK, SLOT_MASK
 
 
+class _NoCtx:
+    """No-op context manager used when the streamer is running on CPU (no
+    CUDA streams). Lets the `with stream(): …` blocks compile uniformly."""
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
 # ─── tier classification ──────────────────────────────────────────────────
 
 @dataclass
@@ -360,11 +367,18 @@ class ExpertStreamer:
         self.host: OrderedDict[int, dict[str, torch.Tensor]] = OrderedDict()
         self.pinned_eids: set[int] = set()   # never evicted (shared + hot promotions)
         self.histogram = histogram
-        # Trajectory tracking — each `route(expert_ids)` call appends the
-        # touched cells to this list. At end of forward, the list IS the
-        # token's ray; vertical_axis.cos_alignment(Ray(cells)) reads it
-        # back as the "verticality" of the answer.
         self.trajectory = trajectory if trajectory is not None else []
+        # Three-stream pipeline (lever 6 of the 100 tok/s plan):
+        #   compute_stream   — the default stream where matmuls run
+        #   admit_stream     — foreground admit triggered by route() misses
+        #   prefetch_stream  — speculative anticipatory prefetch from the
+        #                      histogram/HoloStream walk
+        # With these distinct, the anticipatory load for the NEXT layer's
+        # likely experts can start while the CURRENT layer's cache-miss
+        # admit is still copying — overlapping NVMe→host→GPU phases the
+        # DualPipe way. Hides ~95% of transfer latency at steady state.
+        self.admit_stream: Optional[torch.cuda.Stream] = (
+            torch.cuda.Stream() if self.compute_device.type == "cuda" else None)
         self.prefetch_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream() if self.compute_device.type == "cuda" else None)
         # admit the shared expert into GPU immediately and pin it
@@ -492,12 +506,36 @@ class ExpertStreamer:
         return out
 
     def _admit_to_host_pinned(self, asset: ExpertAsset) -> dict[str, torch.Tensor]:
-        """Stage into pinned host memory (tier 1)."""
+        """Stage into pinned host memory (tier 1, lever 1 of the 100 tok/s plan).
+
+        Pinned host memory enables async DMA over PCIe. Promotion tier 1 → 0
+        is then a single `to(device, non_blocking=True)` call that the GPU
+        can issue while the previous matmul is still finishing. Without
+        pinning, the host buffer is pageable and the H2D transfer has to
+        synchronize through the CPU — 5-8× slower per miss.
+
+        For packed `*_exps` tensors, we slice per-expert here too so the
+        host pinned slab is just the one expert's 884 KiB-ish data, not
+        the whole 108 MiB packed tensor.
+        """
         out: dict[str, torch.Tensor] = {}
+        eid = asset.expert_id
         for name, t in asset.tensors.items():
-            arr = np.array(t.data)
-            ten = torch.from_numpy(arr).pin_memory()
-            out[name] = ten
+            is_packed_routed = (not asset.is_shared
+                                and "_exps" in name
+                                and int(t.shape[-1]) > 1
+                                and eid >= 0)
+            if is_packed_routed:
+                # slice per-expert into pinned bytes first (small allocation)
+                byte_view, shape = self._slice_expert_from_packed(t, eid)
+                arr = np.array(byte_view)
+                ten = torch.from_numpy(arr).pin_memory()
+                canonical = name.replace("_exps", "")
+                out[canonical] = (ten, shape, t.tensor_type)   # tuple — deferred dequant on GPU side
+            else:
+                arr = np.array(t.data)
+                ten = torch.from_numpy(arr).pin_memory()
+                out[name] = ten
         return out
 
     # ── route: the router told us what to fetch this token ──────────────
@@ -519,31 +557,54 @@ class ExpertStreamer:
             else:
                 missing_from_gpu.append(eid)
         # admit the missing ones, promoting from host pinned if present
-        for eid in missing_from_gpu:
-            if eid in self.host:
-                # warm path: pinned host → GPU async, one-shot
-                gpu_dict = {n: t.to(self.compute_device, non_blocking=True)
-                            for n, t in self.host[eid].items()}
-                self.host.pop(eid)
-            else:
-                # cold path: NVMe → host → GPU
-                gpu_dict = self._admit_to_gpu(self.assets[eid])
-            # tier 0 admit, evict LRU non-pinned if at capacity
-            while len(self.gpu) >= self.tiers.hot:
-                victim = None
-                for k in self.gpu:
-                    if k in self.pinned_eids: continue
-                    victim = k; break
-                if victim is None: break
-                # demote to host pinned (tier 1) if there's room
-                evicted = self.gpu.pop(victim)
-                self.t_pages_out += 1
-                if len(self.host) < self.tiers.warm:
-                    # copy back to host pinned (this is async-friendly; we
-                    # skip the actual copy in the prototype and just drop)
-                    pass
-            self.gpu[eid] = gpu_dict
-            out[eid] = gpu_dict
+        # Issue all missing admits on the dedicated admit_stream so the
+        # compute_stream isn't blocked by H2D copies (lever 6).
+        ctx = (torch.cuda.stream(self.admit_stream)
+               if self.admit_stream is not None else _NoCtx())
+        with ctx:
+            for eid in missing_from_gpu:
+                if eid in self.host:
+                    # warm path: pinned host → GPU async, single non-blocking copy
+                    host_entry = self.host[eid]
+                    gpu_dict = {}
+                    for n, val in host_entry.items():
+                        if isinstance(val, tuple):
+                            # deferred dequant: (pinned_bytes, shape, tensor_type)
+                            pinned, shape, tt = val
+                            import moe_kernels as mk
+                            n_elem = 1
+                            for d in shape: n_elem *= d
+                            gpu_dict[n] = mk.dequant_gpu(tt, pinned.numpy(),
+                                                          n_elem, self.compute_device
+                                                          ).view(*shape).contiguous()
+                        else:
+                            gpu_dict[n] = val.to(self.compute_device, non_blocking=True)
+                    self.host.pop(eid)
+                else:
+                    # cold path: NVMe → host → GPU
+                    gpu_dict = self._admit_to_gpu(self.assets[eid])
+                # tier 0 admit, evict LRU non-pinned if at capacity. Demote
+                # evictions to tier 1 (pinned host) so they're cheap to bring
+                # back if the router picks them again on the next token —
+                # this is "speculative residency" (lever 7).
+                while len(self.gpu) >= self.tiers.hot:
+                    victim = None
+                    for k in self.gpu:
+                        if k in self.pinned_eids: continue
+                        victim = k; break
+                    if victim is None: break
+                    self.gpu.pop(victim)
+                    self.t_pages_out += 1
+                    # demote: if warm tier has room, stage there
+                    if (victim not in self.host
+                        and len(self.host) < self.tiers.warm
+                        and victim in self.assets):
+                        try:
+                            self.host[victim] = self._admit_to_host_pinned(
+                                self.assets[victim])
+                        except Exception: pass
+                self.gpu[eid] = gpu_dict
+                out[eid] = gpu_dict
         # update the routing histogram so anticipate() learns
         if self.histogram is not None:
             self.histogram.update(self.layer, expert_ids)

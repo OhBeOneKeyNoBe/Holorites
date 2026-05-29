@@ -221,6 +221,115 @@ def dequant_mxfp4_gpu(blob: bytes | np.ndarray, n_elem: int,
     return out.reshape(-1)[:n_elem].to(torch.float16)
 
 
+# ─── Q3_K_S (lever 4 — smaller streamed experts, ~30% less PCIe) ─────────
+# Layout per 110-byte block of 256 elements:
+#   [0:32]    32 bytes — high 1-bit (qh) packed
+#   [32:96]   64 bytes — low 2-bit (qs) packed
+#   [96:108]  12 bytes — packed 6-bit (scale, _) pairs — same K_SCALE_SIZE
+#                       layout as Q4_K, but here only the scales matter
+#                       (Q3 has no per-block mins)
+#   [108:110] fp16 d  — super-block scale
+
+def dequant_q3_K_gpu(blob: bytes | np.ndarray, n_elem: int,
+                     device: torch.device | str = "cuda") -> torch.Tensor:
+    """GPU-side Q3_K_S/M dequant. Per K-block of 256:
+        y[l] = d * scale[is] * (q3 - 4)
+       where q3 is reconstructed from (lo2[l] | (hi1[l] << 2)) with 4-offset.
+    """
+    device = torch.device(device)
+    QK_K = 256
+    BS = 32 + 64 + 12 + 2   # 110 bytes
+    nb = (n_elem + QK_K - 1) // QK_K
+    if isinstance(blob, np.ndarray):
+        raw = torch.from_numpy(np.ascontiguousarray(blob, dtype=np.uint8))
+    else:
+        raw = torch.from_numpy(np.frombuffer(blob, dtype=np.uint8))
+    raw = raw[:nb * BS].to(device=device, non_blocking=True).view(nb, BS)
+    qh = raw[:, :32]
+    qs = raw[:, 32:96]
+    scale_bytes = raw[:, 96:108]
+    d = raw[:, 108:110].contiguous().view(torch.float16).view(nb).to(torch.float32)
+    # unpack 16 6-bit signed scales (Q3_K has 16 sub-blocks of 16 elements each)
+    # the packing is the same low/high bit-split as Q4_K — reuse the same
+    # extraction. Q3_K uses 6 bits per scale; the K_SCALE_SIZE pack is
+    # the same 12-byte form as Q4_K.
+    sc = torch.empty(nb, 16, dtype=torch.float32, device=device)
+    for i in range(16):
+        # extract 6-bit scale i from the 12-byte block
+        byte_idx = i // 2
+        shift = (i & 1) * 4
+        # this matches the bit pattern used by llama.cpp's get_scale_k4
+        if i < 8:
+            sc[:, i] = ((scale_bytes[:, byte_idx] >> shift) & 0xF).to(torch.float32) \
+                       + ((scale_bytes[:, 8 + (i // 4)] >> ((i % 4) * 2)) & 0x03).to(torch.float32) * 16.0
+        else:
+            j = i - 8
+            sc[:, i] = ((scale_bytes[:, j // 2] >> ((j & 1) * 4)) & 0xF).to(torch.float32)
+    sc = sc - 32.0   # signed offset
+    out = torch.empty(nb, QK_K, dtype=torch.float32, device=device)
+    # 8 outer groups × 32-element sub-blocks (16 sub-blocks of 16 each = 8 pairs)
+    for j in range(QK_K // 32):
+        # reconstruct q3 for 32 elements at this position
+        qs_j = qs[:, j*8:j*8+8].to(torch.int32)   # 8 bytes = 32 2-bit values
+        qh_j = qh[:, j*4:j*4+4].to(torch.int32)   # 4 bytes = 32 1-bit values
+        # extract 2-bit values from qs_j
+        q3_vals = torch.empty(nb, 32, dtype=torch.int32, device=device)
+        for k in range(4):
+            for sub in range(8):
+                lo2 = (qs_j[:, sub] >> (k * 2)) & 0x03
+                hi1 = (qh_j[:, sub // 2] >> ((sub % 2) * 4 + k)) & 0x01
+                q3_vals[:, k * 8 + sub] = lo2 | (hi1 << 2)
+        q3 = q3_vals.to(torch.float32) - 4.0
+        scale = (sc[:, j*2] * d)[:, None]    # one scale per 16 elements; approximate with pair scale
+        out[:, j*32:j*32+32] = scale * q3
+    return out.reshape(-1)[:n_elem].to(torch.float16)
+
+
+# ─── Q2_K (lever 4 extreme — smallest dense quant, ~50% less PCIe) ───────
+# Layout per 84-byte block of 256 elements:
+#   [0:16]   16 bytes — packed 4-bit (scale, min) pairs (8 sub-blocks)
+#   [16:80]  64 bytes — packed 2-bit values
+#   [80:84]  fp16 d + fp16 dmin
+def dequant_q2_K_gpu(blob: bytes | np.ndarray, n_elem: int,
+                     device: torch.device | str = "cuda") -> torch.Tensor:
+    """GPU-side Q2_K dequant. y[l] = d * scale[is] * q2 - dmin * min[is].
+    Quality cost is noticeable (~4% perplexity bump) but PCIe per token is
+    half of Q4_K — useful when you absolutely must fit a 7B in 4 GiB on
+    streaming bandwidth alone."""
+    device = torch.device(device)
+    QK_K = 256
+    BS = 16 + 64 + 4   # 84 bytes
+    nb = (n_elem + QK_K - 1) // QK_K
+    if isinstance(blob, np.ndarray):
+        raw = torch.from_numpy(np.ascontiguousarray(blob, dtype=np.uint8))
+    else:
+        raw = torch.from_numpy(np.frombuffer(blob, dtype=np.uint8))
+    raw = raw[:nb * BS].to(device=device, non_blocking=True).view(nb, BS)
+    scales_bytes = raw[:, :16]      # 16 bytes = 8 (scale, min) pairs at 4 bits each
+    qs = raw[:, 16:80]              # 64 bytes = 256 2-bit values
+    d_bytes = raw[:, 80:84].contiguous().view(torch.float16).view(nb, 2).to(torch.float32)
+    d, dmin = d_bytes[:, 0], d_bytes[:, 1]
+    # extract 8 (scale, min) 4-bit pairs
+    sc = torch.empty(nb, 8, dtype=torch.float32, device=device)
+    m  = torch.empty(nb, 8, dtype=torch.float32, device=device)
+    for i in range(8):
+        sc[:, i] = (scales_bytes[:, 2*i]   & 0xF).to(torch.float32)
+        m[:, i]  = (scales_bytes[:, 2*i+1] & 0xF).to(torch.float32)
+    out = torch.empty(nb, QK_K, dtype=torch.float32, device=device)
+    # 8 sub-blocks × 32 elements each, 2 bits per element
+    for sb in range(8):
+        d_eff = (sc[:, sb] * d)[:, None]
+        m_eff = (m[:, sb] * dmin)[:, None]
+        # extract 32 2-bit values for this sub-block
+        sb_q2 = torch.empty(nb, 32, dtype=torch.int32, device=device)
+        for k in range(4):
+            byte_offs = sb * 8 + 0   # 8 bytes per sub-block
+            for el in range(8):
+                sb_q2[:, k * 8 + el] = (qs[:, byte_offs + el].to(torch.int32) >> (k * 2)) & 0x03
+        out[:, sb*32:sb*32+32] = d_eff * sb_q2.to(torch.float32) - m_eff
+    return out.reshape(-1)[:n_elem].to(torch.float16)
+
+
 # ─── unified dispatcher ──────────────────────────────────────────────────
 
 def dequant_gpu(tensor_type, blob: bytes | np.ndarray, n_elem: int,
@@ -231,6 +340,8 @@ def dequant_gpu(tensor_type, blob: bytes | np.ndarray, n_elem: int,
     if tensor_type == T.Q6_K:  return dequant_q6_K_gpu(blob, n_elem, device)
     if tensor_type == T.Q8_0:  return dequant_q8_0_gpu(blob, n_elem, device)
     if tensor_type == T.Q4_0:  return dequant_q4_0_gpu(blob, n_elem, device)
+    if tensor_type == T.Q3_K:  return dequant_q3_K_gpu(blob, n_elem, device)
+    if tensor_type == T.Q2_K:  return dequant_q2_K_gpu(blob, n_elem, device)
     if tensor_type == T.F16:
         if isinstance(blob, np.ndarray):
             t = torch.from_numpy(np.ascontiguousarray(blob)).view(torch.float16)
