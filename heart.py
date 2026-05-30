@@ -183,6 +183,99 @@ def make_noise_stub_heart(heart_hidden_dim: int, outer_hidden_dim: int,
     )
 
 
+# ─── real heart: Qwen2.5-1.5B-Instruct (hidden-state-in / hidden-state-out) ──
+
+def make_qwen_heart(model_path: str,
+                    outer_hidden_dim: int,
+                    insertion_layer: int,
+                    *,
+                    alpha: float = 0.5,
+                    device: Optional[torch.device] = None,
+                    dtype: torch.dtype = torch.float16) -> "NestedHeart":
+    """Load a Qwen2.x model as the heart's substance.
+
+    Built for Qwen2.5-1.5B-Instruct (hidden=1536, 28 layers) but the
+    hidden_size + layer count are read from the model config, so swapping
+    in Qwen2.5-3B-Instruct (hidden=2048) or Qwen2.5-0.5B (hidden=896)
+    works without code changes.
+
+    Contract — the returned NestedHeart's heart_forward closure:
+
+        hidden: (T, heart_hidden)    — already projected from outer dim
+        position: int                — outer's absolute decode position
+        kv_cache: dict               — stash for the heart's own KV state
+        returns (T, heart_hidden)    — post-final-norm hidden state
+
+    Heart's KV state lives at `kv_cache["hf_cache"]` as a transformers
+    DynamicCache; NestedHeart.reset_kv() drops it so the next call starts
+    fresh. The lm_head is removed (we never decode tokens at the heart).
+
+    `model_path` accepts either a HF hub id ("Qwen/Qwen2.5-1.5B-Instruct")
+    or an absolute path to a snapshot directory.
+    """
+    from transformers import AutoModelForCausalLM
+    try:
+        from transformers.cache_utils import DynamicCache
+    except ImportError:
+        from transformers import DynamicCache  # very new transformers
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    full = AutoModelForCausalLM.from_pretrained(
+        model_path, torch_dtype=dtype, low_cpu_mem_usage=True)
+    inner = full.model  # the Qwen2Model: embed_tokens + layers + norm
+    # We feed inputs_embeds, never input_ids → lm_head is dead weight.
+    try: del full.lm_head
+    except Exception: pass
+    inner = inner.to(device).eval()
+
+    heart_hidden = int(inner.config.hidden_size)
+    param_mb = int(sum(p.numel() * p.element_size()
+                       for p in inner.parameters()) / 1024**2)
+
+    @torch.inference_mode()
+    def heart_forward(hidden: torch.Tensor, position: int,
+                      kv_cache: dict) -> torch.Tensor:
+        # hidden: (T, heart_hidden) — usually T=1 in decode
+        if hidden.dim() == 1:
+            hidden = hidden.unsqueeze(0)
+        T = hidden.shape[0]
+        inputs_embeds = hidden.to(device=device, dtype=inner.dtype).unsqueeze(0)
+        position_ids = torch.arange(position, position + T,
+                                    device=inputs_embeds.device).unsqueeze(0)
+        cache = kv_cache.get("hf_cache")
+        if cache is None:
+            cache = DynamicCache()
+            kv_cache["hf_cache"] = cache
+        out = inner(
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            past_key_values=cache,
+            use_cache=True,
+            return_dict=True,
+        )
+        hs = out.last_hidden_state.squeeze(0)   # (T, H)
+        return hs.to(hidden.dtype)
+
+    heart = NestedHeart(
+        heart_forward=heart_forward,
+        heart_hidden_dim=heart_hidden,
+        outer_hidden_dim=outer_hidden_dim,
+        insertion_layer=insertion_layer,
+        alpha=alpha,
+        device=device,
+        dtype=dtype,
+        heart_resident_mb_estimate=param_mb,
+    )
+    # Stash the inner model on the NestedHeart so it isn't garbage-collected
+    # the moment make_qwen_heart returns. The heart_forward closure already
+    # holds a reference, but pinning it on the dataclass makes inspection
+    # trivial (heart._inner) for debugging.
+    heart.__dict__["_inner"] = inner
+    return heart
+
+
 # ─── synthetic self-test (no model load) ─────────────────────────────────
 
 def _selftest():
